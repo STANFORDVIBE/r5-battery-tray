@@ -1,3 +1,5 @@
 # Статическая сборка рантайма C: exe не зависит от установленного Visual C++ Redistributable.
+# DEPENDENTLOADFLAG 0x800: системные DLL (hid.dll и др.) грузятся только из System32 —
+# подложенная рядом с exe подделка (например, в «Загрузках») не подхватится.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DEPENDENTLOADFLAG:0x800"]

@@ -13,6 +13,9 @@ use windows_sys::Win32::{
     System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW},
     System::Registry::*,
     System::Threading::CreateMutexW,
+    Networking::WinInet::DeleteUrlCacheEntryW,
+    Security::Cryptography::*,
+    System::Com::Urlmon::URLDownloadToFileW,
     UI::Shell::*,
     UI::WindowsAndMessaging::*,
 };
@@ -21,6 +24,9 @@ const WM_TRAY: u32 = WM_APP + 1;
 const ID_REFRESH: usize = 1;
 const ID_AUTORUN: usize = 2;
 const ID_EXIT: usize = 3;
+const ID_UPDATE: usize = 4;
+const REPO: &str = "STANFORDVIBE/r5-battery-tray";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const APP: &str = "R5BatteryTray";
 
@@ -31,12 +37,13 @@ struct State {
     last_tip: Option<String>, // последний удачный ответ: спящая мышь заряд не отдаёт, держим старый
     good_path: Option<Vec<u16>>, // интерфейс, который уже ответил, чтобы не перебирать каждый раз
     taskbar_msg: u32,
+    mutex: HANDLE, // отпускаем перед перезапуском после обновления, иначе новая копия решит, что уже запущена
 }
 
 thread_local! {
     static ST: RefCell<State> = RefCell::new(State {
         hwnd: ptr::null_mut(), icon: ptr::null_mut(), tip: String::new(),
-        last_tip: None, good_path: None, taskbar_msg: 0,
+        last_tip: None, good_path: None, taskbar_msg: 0, mutex: ptr::null_mut(),
     });
 }
 
@@ -46,7 +53,7 @@ fn w(s: &str) -> Vec<u16> {
 
 fn main() {
     unsafe {
-        CreateMutexW(ptr::null(), 1, w("R5BatteryTray_single").as_ptr());
+        let mutex = CreateMutexW(ptr::null(), 1, w("R5BatteryTray_single").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
@@ -61,7 +68,8 @@ fn main() {
         let hwnd = CreateWindowExW(0, cls.as_ptr(), cls.as_ptr(), 0, 0, 0, 0, 0,
             ptr::null_mut(), ptr::null_mut(), hinst, ptr::null());
         let tb = RegisterWindowMessageW(w("TaskbarCreated").as_ptr());
-        ST.with(|s| { let mut s = s.borrow_mut(); s.hwnd = hwnd; s.taskbar_msg = tb; });
+        ST.with(|s| { let mut s = s.borrow_mut(); s.hwnd = hwnd; s.taskbar_msg = tb; s.mutex = mutex; });
+        remove_old_exe();
 
         update();
         notify(NIM_ADD);
@@ -78,7 +86,7 @@ fn main() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let tb = ST.with(|s| s.borrow().taskbar_msg);
     match msg {
-        WM_TIMER => { update(); notify(NIM_MODIFY); }
+        WM_TIMER => { remove_old_exe(); update(); notify(NIM_MODIFY); }
         WM_TRAY => match lp as u32 {
             WM_LBUTTONUP => { update(); notify(NIM_MODIFY); }
             WM_RBUTTONUP => menu(hwnd),
@@ -95,6 +103,7 @@ unsafe fn menu(hwnd: HWND) {
     let auto = if autorun_get() { MF_CHECKED } else { MF_UNCHECKED };
     AppendMenuW(m, MF_STRING, ID_REFRESH, w("Обновить").as_ptr());
     AppendMenuW(m, MF_STRING | auto, ID_AUTORUN, w("Запускать с Windows").as_ptr());
+    AppendMenuW(m, MF_STRING, ID_UPDATE, w(&format!("Проверить обновления (v{VERSION})")).as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
     AppendMenuW(m, MF_STRING, ID_EXIT, w("Выход").as_ptr());
     let mut pt: POINT = mem::zeroed();
@@ -106,6 +115,7 @@ unsafe fn menu(hwnd: HWND) {
     match cmd as usize {
         ID_REFRESH => { update(); notify(NIM_MODIFY); }
         ID_AUTORUN => autorun_set(!autorun_get()),
+        ID_UPDATE => check_update(hwnd),
         ID_EXIT => { notify(NIM_DELETE); PostQuitMessage(0); }
         _ => {}
     }
@@ -260,38 +270,73 @@ fn parse(res: &[u8; 65]) -> Option<(u8, bool)> {
 
 // ---------- иконка ----------
 
-// Горизонтальная батарейка: белый контур, заливка по проценту.
-// Зелёная — норм, жёлтая — заряжается, красная — ≤20%. pct=0 — пустая.
-fn battery_pixels(s: i32, pct: u8, charging: bool) -> Vec<u32> {
+// Мышь пиксель-артом 16×16 в стиле KbBatteryTray: белый контур, две кнопки, под ними корпус.
+// Заряд — корпус заливается снизу вверх, как уровень жидкости: зелёным (≤20% — красным), остальное серое.
+// Зарядка — маленькая жёлтая молния в правом верхнем углу.
+// shortcut: масштаб только целый (16→32), на 20/24 px рисунок 16 px по центру — мельче, зато чёткий.
+// Строки корпуса под кнопками сверху вниз: (x, ширина) заливки.
+const FILL: [(i32, i32); 7] = [(3, 9), (3, 9), (3, 9), (3, 9), (3, 9), (3, 9), (4, 7)];
+const FILL_TOP: i32 = 7;
+
+// Молния пиксель-артом 5×7.
+const BOLT: [&str; 7] = ["...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..."];
+
+fn icon_pixels(s: i32, pct: u8, charging: bool) -> Vec<u32> {
     const WHITE: u32 = 0xFFFF_FFFF;
-    let fill = if charging { 0xFFFF_D700 } else if pct <= 20 { 0xFFFF_0000 } else { 0xFF32_CD32 };
-    let pen = (s / 16).max(1);
-    let h = s * 9 / 16;
-    let top = (s - h) / 2;
-    let body_w = s - s / 8;
+    const GREY: u32 = 0xFF6E_6E6E;
+    const YELLOW: u32 = 0xFFFF_D60A;
+    const DARK: u32 = 0xFF1E_1E1E;
+    let lit = if pct <= 20 { 0xFFFF_3B30 } else { 0xFF34_C759 };
+    let f = (s / 16).max(1);
+    let o = (s - 16 * f) / 2;
     let mut px = vec![0u32; (s * s) as usize];
-    let mut rect = |x0: i32, y0: i32, w: i32, hh: i32, c: u32| {
-        for y in y0.max(0)..(y0 + hh).min(s) {
-            for x in x0.max(0)..(x0 + w).min(s) {
-                px[(y * s + x) as usize] = c;
+    let mut rect = |x: i32, y: i32, w: i32, h: i32, c: u32| {
+        for yy in (o + y * f).max(0)..(o + (y + h) * f).min(s) {
+            for xx in (o + x * f).max(0)..(o + (x + w) * f).min(s) {
+                px[(yy * s + xx) as usize] = c;
             }
         }
     };
-    rect(0, top, body_w, pen, WHITE); // корпус
-    rect(0, top + h - pen, body_w, pen, WHITE);
-    rect(0, top, pen, h, WHITE);
-    rect(body_w - pen, top, pen, h, WHITE);
-    rect(body_w, top + h / 4, s - body_w, h - h / 2, WHITE); // носик
-    let inner = body_w - 4 * pen;
-    let fw = if pct == 0 { 0 } else { ((inner * pct as i32 + 50) / 100).max(pen) };
-    rect(2 * pen, top + 2 * pen, fw, h - 4 * pen, fill);
+    // контур 11×14 (x 2..12, y 1..14), углы срезаны ступенькой
+    rect(5, 1, 5, 1, WHITE);
+    rect(3, 2, 2, 1, WHITE);
+    rect(10, 2, 2, 1, WHITE);
+    rect(7, 2, 1, 4, WHITE); // щель между кнопками
+    rect(2, 3, 1, 10, WHITE);
+    rect(12, 3, 1, 10, WHITE);
+    rect(2, 6, 11, 1, WHITE); // низ кнопок
+    rect(3, 13, 1, 1, WHITE);
+    rect(11, 13, 1, 1, WHITE);
+    rect(4, 14, 7, 1, WHITE);
+    // сколько строк залито, считая снизу; любой ненулевой заряд — хотя бы одна
+    let n = (FILL.len() * pct as usize).div_ceil(100);
+    for (i, (x, w)) in FILL.into_iter().enumerate() {
+        let on = FILL.len() - i <= n;
+        rect(x, FILL_TOP + i as i32, w, 1, if on { lit } else { GREY });
+    }
+    if charging {
+        let (bx, by) = (11, 0); // правый верхний угол, как бейдж
+        let inb = |x: i32, y: i32| {
+            (0..7).contains(&(y - by)) && (0..5).contains(&(x - bx))
+                && BOLT[(y - by) as usize].as_bytes()[(x - bx) as usize] == b'#'
+        };
+        for y in -1..17 {
+            for x in -1..17 {
+                if inb(x, y) {
+                    rect(x, y, 1, 1, YELLOW);
+                } else if [(0, -1), (0, 1), (-1, 0), (1, 0)].iter().any(|&(dx, dy)| inb(x + dx, y + dy)) {
+                    rect(x, y, 1, 1, DARK); // обводка, чтобы молния не сливалась с корпусом
+                }
+            }
+        }
+    }
     px
 }
 
 fn make_icon(pct: u8, charging: bool) -> HICON {
     unsafe {
         let s = GetSystemMetrics(SM_CXSMICON).max(16);
-        let px = battery_pixels(s, pct, charging);
+        let px = icon_pixels(s, pct, charging);
         let mut bi: BITMAPINFO = mem::zeroed();
         bi.bmiHeader.biSize = mem::size_of::<BITMAPINFOHEADER>() as u32;
         bi.bmiHeader.biWidth = s;
@@ -308,6 +353,129 @@ fn make_icon(pct: u8, charging: bool) -> HICON {
         DeleteObject(mask);
         icon
     }
+}
+
+// ---------- обновление ----------
+// Только по кнопке в меню: смотрим последний релиз на GitHub, качаем exe и его подпись, подменяем себя и перезапускаемся.
+// Подпись (ECDSA P-256 + SHA-256) сверяем с вшитым открытым ключом: даже со взломанным GitHub чужой exe не встанет.
+// Закрытый ключ — только у автора (scripts/sign-release.ps1).
+const RELEASE_PUB: &[u8] = include_bytes!("../release.pub");
+// shortcut: качаем прямо в потоке окна — пару секунд иконка не реагирует; хватает, пока exe маленький.
+
+fn download(url: &str, to: &std::path::Path) -> bool {
+    let (u, f) = (w(url), w(&to.to_string_lossy()));
+    unsafe {
+        DeleteUrlCacheEntryW(u.as_ptr()); // иначе Windows может отдать старый ответ из кэша
+        URLDownloadToFileW(ptr::null_mut(), u.as_ptr(), f.as_ptr(), 0, ptr::null_mut()) == 0
+    }
+}
+
+fn message(hwnd: HWND, text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    unsafe { MessageBoxW(hwnd, w(text).as_ptr(), w("Заряд мыши").as_ptr(), flags) }
+}
+
+fn check_update(hwnd: HWND) {
+    let json = std::env::temp_dir().join("R5BatteryTray-latest.json");
+    let tag = download(&format!("https://api.github.com/repos/{REPO}/releases/latest"), &json)
+        .then(|| std::fs::read_to_string(&json).ok())
+        .flatten()
+        .and_then(|s| latest_tag(&s));
+    let _ = std::fs::remove_file(&json);
+    let Some(tag) = tag else {
+        message(hwnd, "Не получилось проверить обновления. Есть интернет?", MB_ICONWARNING);
+        return;
+    };
+    if !newer(&tag, VERSION) {
+        message(hwnd, &format!("Стоит последняя версия v{VERSION}."), MB_ICONINFORMATION);
+        return;
+    }
+    let ask = format!("Вышла новая версия {tag} (у тебя v{VERSION}). Обновить?");
+    if message(hwnd, &ask, MB_YESNO | MB_ICONQUESTION) == IDYES {
+        if let Err(e) = install() {
+            message(hwnd, &format!("Не получилось обновиться: {e}"), MB_ICONWARNING);
+        }
+    }
+}
+
+// Качает новый exe рядом, подменяет текущий (запущенный exe Windows переименовать даёт) и перезапускает.
+fn install() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let new = exe.with_file_name("R5BatteryTray.new.exe");
+    let old = exe.with_file_name("R5BatteryTray.old.exe");
+    let url = format!("https://github.com/{REPO}/releases/latest/download/R5BatteryTray.exe");
+    if !download(&url, &new) {
+        return Err("файл не скачался".into());
+    }
+    // вместо exe может прийти страница с ошибкой — проверяем, что это программа
+    let ok = std::fs::read(&new).map(|b| b.len() > 50_000 && b.starts_with(b"MZ")).unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&new);
+        return Err("скачался не тот файл".into());
+    }
+    let sig_file = exe.with_file_name("R5BatteryTray.new.exe.sig");
+    let signed = download(&format!("{url}.sig"), &sig_file)
+        && match (std::fs::read(&new), std::fs::read(&sig_file)) {
+            (Ok(data), Ok(sig)) => signature_ok(RELEASE_PUB, &data, &sig),
+            _ => false,
+        };
+    let _ = std::fs::remove_file(&sig_file);
+    if !signed {
+        let _ = std::fs::remove_file(&new);
+        return Err("подпись не сходится — это не официальная версия, ставить не буду".into());
+    }
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(&exe, &old).map_err(|e| e.to_string())?;
+    if let Err(e) = std::fs::rename(&new, &exe) {
+        let _ = std::fs::rename(&old, &exe); // вернуть как было
+        return Err(e.to_string());
+    }
+    ST.with(|s| unsafe { CloseHandle(s.borrow().mutex) });
+    if let Err(e) = std::process::Command::new(&exe).spawn() {
+        return Err(format!("новая версия не запустилась: {e}")); // exe уже новый — запустится при следующем старте
+    }
+    notify(NIM_DELETE);
+    unsafe { PostQuitMessage(0) };
+    Ok(())
+}
+
+fn signature_ok(pubkey: &[u8], data: &[u8], sig: &[u8]) -> bool {
+    unsafe {
+        let mut hash = [0u8; 32];
+        if BCryptHash(BCRYPT_SHA256_ALG_HANDLE, ptr::null(), 0, data.as_ptr(), data.len() as u32, hash.as_mut_ptr(), 32) != 0 {
+            return false;
+        }
+        let mut alg = ptr::null_mut();
+        if BCryptOpenAlgorithmProvider(&mut alg, BCRYPT_ECDSA_P256_ALGORITHM, ptr::null(), 0) != 0 {
+            return false;
+        }
+        let mut key = ptr::null_mut();
+        let mut ok = false;
+        if BCryptImportKeyPair(alg, ptr::null_mut(), BCRYPT_ECCPUBLIC_BLOB, &mut key, pubkey.as_ptr(), pubkey.len() as u32, 0) == 0 {
+            ok = BCryptVerifySignature(key, ptr::null(), hash.as_ptr(), 32, sig.as_ptr(), sig.len() as u32, 0) == 0;
+            BCryptDestroyKey(key);
+        }
+        BCryptCloseAlgorithmProvider(alg, 0);
+        ok
+    }
+}
+
+// Старый exe остаётся после обновления; удалить получится, когда прежняя копия закроется.
+fn remove_old_exe() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_file_name("R5BatteryTray.old.exe"));
+    }
+}
+
+fn latest_tag(json: &str) -> Option<String> {
+    let rest = &json[json.find("\"tag_name\"")? + 10..];
+    let rest = &rest[rest.find('"')? + 1..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+// «v0.3.0» новее «0.2.1»?
+fn newer(tag: &str, current: &str) -> bool {
+    let parse = |v: &str| v.trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect::<Vec<u32>>();
+    parse(tag) > parse(current)
 }
 
 // ---------- автозапуск ----------
@@ -349,6 +517,33 @@ fn autorun_set(on: bool) {
 mod tests {
     use super::*;
 
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn signature_check() {
+        // одноразовый тестовый ключ, подпись сделана .NET ECDsaCng — как в sign-release.ps1
+        let pubk = unhex("4543533120000000045c965b062a2ee5d043b343040748bbe0fa178354c354c19ed5e67e691fd7a2eceeb80dad190444672295719a10b33f928ae4a780e16430c5d4d252ece433cf");
+        let sig = unhex("3427ebe0cc59a334f43be37761254ed02b3abfa231795d0447f937a15df42dc584319dad480609779b913305791525e300ec7f514835d3b62372a6a2bde1eea8");
+        assert!(signature_ok(&pubk, b"KbBatteryTray test", &sig));
+        assert!(!signature_ok(&pubk, b"KbBatteryTray tesT", &sig)); // подменённый файл
+        assert!(!signature_ok(RELEASE_PUB, b"KbBatteryTray test", &sig)); // чужой ключ
+        assert!(!signature_ok(&pubk, b"KbBatteryTray test", &sig[..10])); // обрезанная подпись
+        assert_eq!(RELEASE_PUB.len(), 72);
+    }
+
+    #[test]
+    fn update_version_logic() {
+        let json = r#"{"url":"x","tag_name":"v0.3.0","name":"0.3.0"}"#;
+        assert_eq!(latest_tag(json).as_deref(), Some("v0.3.0"));
+        assert_eq!(latest_tag("{}"), None);
+        assert!(newer("v0.3.0", "0.2.0"));
+        assert!(newer("v0.10.0", "0.9.9"));
+        assert!(!newer("v0.2.0", "0.2.0"));
+        assert!(!newer("v0.1.5", "0.2.0"));
+    }
+
     #[test]
     fn parses_battery_reply() {
         let mut r = [0u8; 65];
@@ -360,10 +555,53 @@ mod tests {
         assert_eq!(parse(&r), None);
     }
 
+    // Превью всех состояний на тёмном фоне трея: cargo test preview -- --ignored, смотреть preview.bmp
+    #[test]
+    #[ignore]
+    fn preview() {
+        let states = [(0, false), (15, false), (60, false), (100, false), (15, true), (60, true)];
+        let sizes = [16, 20, 24, 32];
+        let (cell, pad) = (128usize, 8usize);
+        let (w, h) = (states.len() * (cell + pad) + pad, sizes.len() * (cell + pad) + pad);
+        let mut img = vec![0x2020_20u32; w * h];
+        for (r, &s) in sizes.iter().enumerate() {
+            for (c, &(pct, ch)) in states.iter().enumerate() {
+                let px = icon_pixels(s, pct, ch);
+                for y in 0..cell {
+                    for x in 0..cell {
+                        let p = px[(y * s as usize / cell) * s as usize + x * s as usize / cell];
+                        if p >> 24 != 0 {
+                            img[(pad + r * (cell + pad) + y) * w + pad + c * (cell + pad) + x] = p & 0xFF_FFFF;
+                        }
+                    }
+                }
+            }
+        }
+        let row = (w * 3 + 3) & !3;
+        let mut f = Vec::new();
+        f.extend(b"BM");
+        f.extend(((54 + row * h) as u32).to_le_bytes());
+        f.extend([0u8; 4]);
+        f.extend(54u32.to_le_bytes());
+        f.extend(40u32.to_le_bytes());
+        f.extend((w as i32).to_le_bytes());
+        f.extend((-(h as i32)).to_le_bytes());
+        f.extend(1u16.to_le_bytes());
+        f.extend(24u16.to_le_bytes());
+        f.extend([0u8; 24]);
+        for y in 0..h {
+            for x in 0..w {
+                f.extend(&img[y * w + x].to_le_bytes()[..3]);
+            }
+            f.resize(f.len() + row - w * 3, 0);
+        }
+        std::fs::write("preview.bmp", f).unwrap();
+    }
+
     #[test]
     fn fill_grows_with_charge() {
-        let green = |pct| battery_pixels(16, pct, false).iter().filter(|&&c| c == 0xFF32_CD32).count();
+        let green = |pct| icon_pixels(16, pct, false).iter().filter(|&&c| c == 0xFF34_C759).count();
         assert_eq!(green(0), 0);
-        assert!(green(30) < green(69) && green(69) < green(100));
+        assert!(green(30) < green(60) && green(60) < green(100));
     }
 }
