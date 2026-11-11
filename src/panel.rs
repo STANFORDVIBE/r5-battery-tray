@@ -12,7 +12,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::*,
-    Graphics::{Gdi::*, GdiPlus::*},
+    Graphics::{Dwm::DwmFlush, Gdi::*, GdiPlus::*},
     System::{LibraryLoader::GetModuleHandleW, Threading::{AttachThreadInput, GetCurrentThreadId}},
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
@@ -42,7 +42,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3; // нет в windows-sys без лишней 
 const PARGB: i32 = 0xE200B; // PixelFormat32bppPARGB
 const WM_LOADED: u32 = WM_APP + 10;
 const WM_CLOSE_PANEL: u32 = WM_APP + 11;
-const T_ANIM: usize = 1;
+const WM_ANIM: u32 = WM_APP + 12;
 const T_WATCH: usize = 2;
 const T_DPI: usize = 3; // запись DPI после прокрутки колёсика — с задержкой, одной командой
 const T_LEAVE: usize = 4; // курсор ушёл с панели — сворачиваем, если не вернулся
@@ -93,7 +93,8 @@ struct Panel {
     panel_rc: RECT, // окно панели с полем под тень
     genie: bool,
     slide: (f32, f32),
-    snap: *mut GpBitmap,
+    snap: Vec<u32>, // снимок панели для «джинна» (PARGB, ширина и высота — как у panel_rc); пусто — нет анимации
+    snap_w: usize,
     fg_at_open: HWND,
     // буфер кадра
     dc: HDC,
@@ -111,6 +112,7 @@ struct Fonts {
 }
 
 thread_local! {
+    static LOOPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static P: RefCell<Option<Panel>> = const { RefCell::new(None) };
 }
 
@@ -202,7 +204,7 @@ pub fn init() {
             hwnd, scale, set: None, battery: None, wired: false, status: Status::Loading,
             hits: Vec::new(), hover: None, entered: false, reset_armed: false, names: load_names(), editing: None, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
-            genie: true, slide: (0.0, 1.0), snap: ptr::null_mut(), fg_at_open: ptr::null_mut(),
+            genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, fg_at_open: ptr::null_mut(),
             dc: ptr::null_mut(), dib: ptr::null_mut(), old: ptr::null_mut(), bits: ptr::null_mut(), buf_w: 0, buf_h: 0,
             fonts: Fonts { regular, semibold },
         };
@@ -279,7 +281,7 @@ impl Panel {
         self.hidden_at = Some(Instant::now());
         self.hover = None;
         if self.genie {
-            if self.snap.is_null() {
+            if self.snap.is_empty() {
                 self.take_snap();
             }
             let u = self.genie_rect();
@@ -291,15 +293,17 @@ impl Panel {
     fn start_anim(&mut self) {
         self.anim_from = self.progress;
         self.anim_start = Instant::now();
-        unsafe { SetTimer(self.hwnd, T_ANIM, 10, None) };
+        if !LOOPING.get() {
+            unsafe { PostMessageW(self.hwnd, WM_ANIM, 0, 0) };
+        }
     }
 
-    fn animate(&mut self) {
+    // Один кадр; false — анимация закончилась
+    fn animate(&mut self) -> bool {
         let ms = if self.genie { if self.closing { CLOSE_MS } else { OPEN_MS } } else if self.closing { 160.0 } else { 230.0 };
         let t = (self.anim_start.elapsed().as_secs_f32() * 1000.0 / ms).min(1.0);
         self.progress = if self.closing { self.anim_from * (1.0 - t) } else { self.anim_from + (1.0 - self.anim_from) * t };
         if t >= 1.0 {
-            unsafe { KillTimer(self.hwnd, T_ANIM) };
             self.drop_snap();
             if self.closing {
                 self.closing = false;
@@ -308,10 +312,13 @@ impl Panel {
                     KillTimer(self.hwnd, T_WATCH);
                     ShowWindow(self.hwnd, SW_HIDE);
                 }
+                self.move_to(self.panel_rc);
+                return false; // спрятанную панель не рисуем
             }
             self.move_to(self.panel_rc); // окно снова ровно по панели — чтобы мышь попадала куда надо
         }
         self.render();
+        t < 1.0
     }
 
     fn animating(&self) -> bool {
@@ -546,7 +553,9 @@ impl Panel {
         if r.battery.is_some() {
             self.battery = r.battery;
         }
-        if self.visible && !self.animating() {
+        if !self.snap.is_empty() {
+            self.take_snap(); // данные пришли посреди анимации — следующий кадр уже с ними, без скачка в конце
+        } else if self.visible && !self.animating() {
             self.render();
         }
     }
@@ -593,8 +602,12 @@ impl Panel {
             GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut g);
             GdipGraphicsClear(g, 0);
             let alpha;
-            if !self.snap.is_null() {
-                alpha = self.draw_genie(g, r);
+            if !self.snap.is_empty() {
+                let pr = self.panel_rc;
+                let dst = std::slice::from_raw_parts_mut(self.bits as *mut u32, (w * h) as usize);
+                alpha = genie_frame(dst, w as usize, &self.snap, self.snap_w,
+                    ((pr.left - r.left) as f32, (pr.top - r.top) as f32),
+                    ((self.anchor.x - r.left) as f32, (self.anchor.y - r.top) as f32), self.progress);
             } else {
                 let e = 1.0 - (1.0 - self.progress).powi(3);
                 let (dx, dy) = (self.slide.0 * SLIDE * (1.0 - e), self.slide.1 * SLIDE * (1.0 - e));
@@ -613,61 +626,28 @@ impl Panel {
         }
     }
 
-    // Снимок панели целиком: «джинн» гнёт его полосками
+    // Снимок панели целиком: «джинн» гнёт его построчно
     fn take_snap(&mut self) {
-        self.drop_snap();
         let r = self.panel_rc;
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let mut buf = vec![0u32; (w * h) as usize];
         unsafe {
             let mut bmp = ptr::null_mut();
-            GdipCreateBitmapFromScan0(r.right - r.left, r.bottom - r.top, 0, PARGB, ptr::null(), &mut bmp);
+            GdipCreateBitmapFromScan0(w, h, w * 4, PARGB, buf.as_mut_ptr() as *mut u8, &mut bmp);
             let mut g = ptr::null_mut();
             GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut g);
-            GdipGraphicsClear(g, 0);
             GdipScaleWorldTransform(g, self.scale, self.scale, MatrixOrderPrepend);
             GdipTranslateWorldTransform(g, S, S, MatrixOrderPrepend);
             self.draw_all(g);
             GdipDeleteGraphics(g);
-            self.snap = bmp;
+            GdipDisposeImage(bmp as *mut GpImage);
         }
+        self.snap = buf;
+        self.snap_w = w as usize;
     }
 
     fn drop_snap(&mut self) {
-        if !self.snap.is_null() {
-            unsafe { GdipDisposeImage(self.snap as *mut GpImage) };
-            self.snap = ptr::null_mut();
-        }
-    }
-
-    // Кадр «джинна»: снимок режется на полоски по 2 пикселя. Чем ниже полоска и чем раньше в анимации,
-    // тем сильнее она стянута к иконке — бока выгибаются воронкой, а панель вытекает снизу вверх
-    unsafe fn draw_genie(&self, g: *mut GpGraphics, win: RECT) -> u8 {
-        let pr = self.panel_rc;
-        let (px, py) = ((pr.left - win.left) as f32, (pr.top - win.top) as f32);
-        let (pw, ph) = ((pr.right - pr.left) as f32, (pr.bottom - pr.top) as f32);
-        let (ax, ay) = ((self.anchor.x - win.left) as f32, (self.anchor.y - win.top) as f32);
-        let t = self.progress;
-        let top = lerp(ay, py, smooth(clamp01(t / 0.8))); // верх догоняет позже
-        let bot = lerp(ay, py + ph, smooth(clamp01(t / 0.45))); // низ быстро отрывается от иконки
-        let squeeze = 1.0 - smooth(clamp01((t - 0.25) / 0.75)); // 1 — бока стянуты в иконку, 0 — прямые
-        let span = (ay - py).max(1.0);
-        if bot - top < 1.0 {
-            return 0;
-        }
-        GdipSetInterpolationMode(g, InterpolationModeBilinear);
-        GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
-        let step = 2.0;
-        let src_step = step * ph / (bot - top);
-        let mut y = top;
-        while y < bot {
-            let f = smooth(clamp01((y - py) / span)) * squeeze;
-            let l = lerp(px, ax - 4.0, f);
-            let r = lerp(px + pw, ax + 4.0, f);
-            let sy = (y - top) / (bot - top) * ph;
-            GdipDrawImageRectRect(g, self.snap as *mut GpImage, l, y, r - l, step, 0.0, sy, pw, src_step,
-                UnitPixel, ptr::null(), 0, ptr::null_mut());
-            y += step;
-        }
-        (255.0 * clamp01(t / 0.12)) as u8
+        self.snap = Vec::new();
     }
 
     unsafe fn draw_all(&mut self, g: *mut GpGraphics) {
@@ -897,6 +877,70 @@ impl Draw<'_> {
     }
 }
 
+// Кадр «джинна» прямо в пиксели окна: каждая строка снимка сжимается по ширине к иконке.
+// Чем ниже строка и чем раньше в анимации, тем сильнее стянута — бока выгибаются воронкой, панель вытекает снизу вверх.
+// Свой цикл вместо сотен вызовов GDI+ на кадр: ~10 мс → пара мс, и строки по 1 пикселю, а не по 2.
+// dst уже очищен; возвращает общую прозрачность кадра.
+fn genie_frame(dst: &mut [u32], dw: usize, src: &[u32], sw: usize, (px, py): (f32, f32), (ax, ay): (f32, f32), t: f32) -> u8 {
+    let sh = src.len() / sw.max(1);
+    let dh = dst.len() / dw.max(1);
+    let (pw, ph) = (sw as f32, sh as f32);
+    let top = lerp(ay, py, smooth(clamp01(t / 0.8))); // верх догоняет позже
+    let bot = lerp(ay, py + ph, smooth(clamp01(t / 0.45))); // низ быстро отрывается от иконки
+    let squeeze = 1.0 - smooth(clamp01((t - 0.25) / 0.75)); // 1 — бока стянуты в иконку, 0 — прямые
+    let span = (ay - py).max(1.0);
+    if bot - top < 1.0 || sh == 0 {
+        return 0;
+    }
+    let y0 = top.floor().max(0.0) as usize;
+    let y1 = (bot.ceil().max(0.0) as usize).min(dh);
+    for y in y0..y1 {
+        let yc = y as f32 + 0.5;
+        if yc < top || yc >= bot {
+            continue;
+        }
+        let f = smooth(clamp01((yc - py) / span)) * squeeze;
+        let l = lerp(px, ax - 4.0, f);
+        let r = lerp(px + pw, ax + 4.0, f);
+        if r - l < 0.5 {
+            continue;
+        }
+        // строка снимка (с подмешиванием соседней — без лесенки при сжатии по высоте)
+        let sy = ((yc - top) / (bot - top) * ph - 0.5).clamp(0.0, ph - 1.0);
+        let (sy0, fy) = (sy as usize, sy.fract());
+        let sy1 = (sy0 + 1).min(sh - 1);
+        let (row0, row1) = (&src[sy0 * sw..][..sw], &src[sy1 * sw..][..sw]);
+        let k = pw / (r - l);
+        let x0 = l.floor().max(0.0) as usize;
+        let x1 = (r.ceil().max(0.0) as usize).min(dw);
+        let out = &mut dst[y * dw..][..dw];
+        for x in x0..x1 {
+            let xc = x as f32 + 0.5;
+            let cover = clamp01((xc + 0.5).min(r) - (xc - 0.5).max(l)); // сглаживание краёв воронки
+            if cover <= 0.0 {
+                continue;
+            }
+            let sx = ((xc - l) * k - 0.5).clamp(0.0, pw - 1.0);
+            let (sx0, fx) = (sx as usize, sx.fract());
+            let sx1 = (sx0 + 1).min(sw - 1);
+            out[x] = mix4(row0[sx0], row0[sx1], row1[sx0], row1[sx1], fx, fy, cover);
+        }
+    }
+    (255.0 * clamp01(t / 0.12)) as u8
+}
+
+// Билинейное смешивание четырёх пикселей PARGB, умноженное на покрытие
+fn mix4(a: u32, b: u32, c: u32, d: u32, fx: f32, fy: f32, cover: f32) -> u32 {
+    let (wa, wb, wc, wd) = ((1.0 - fx) * (1.0 - fy) * cover, fx * (1.0 - fy) * cover, (1.0 - fx) * fy * cover, fx * fy * cover);
+    let mut out = 0u32;
+    for sh in [0, 8, 16, 24] {
+        let ch = |p: u32| ((p >> sh) & 0xFF) as f32;
+        let v = ch(a) * wa + ch(b) * wb + ch(c) * wc + ch(d) * wd;
+        out |= ((v + 0.5) as u32).min(255) << sh;
+    }
+    out
+}
+
 fn lerp(a: f32, b: f32, k: f32) -> f32 { a + (b - a) * k }
 fn clamp01(v: f32) -> f32 { v.clamp(0.0, 1.0) }
 fn smooth(k: f32) -> f32 { k * k * (3.0 - 2.0 * k) }
@@ -941,10 +985,33 @@ fn force_foreground(h: HWND) {
     }
 }
 
+// Анимация кадр за кадром в такт обновлению экрана (DwmFlush ждёт следующий кадр композитора).
+// Таймер Windows тикает с шагом 15,6 мс и сбивается, отсюда были рывки. Сообщения в это время продолжают обрабатываться.
+unsafe fn anim_loop() {
+    if LOOPING.replace(true) {
+        return;
+    }
+    while with(|p| p.animate()).unwrap_or(false) {
+        if DwmFlush() < 0 {
+            thread::sleep(Duration::from_millis(8)); // композитор недоступен — просто не грузим процессор
+        }
+        let mut msg: MSG = mem::zeroed();
+        while PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            if msg.message == WM_QUIT {
+                PostQuitMessage(msg.wParam as i32); // вернём выход основному циклу
+                LOOPING.set(false);
+                return;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    LOOPING.set(false);
+}
+
 unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let done = match msg {
         WM_TIMER => with(|p| match wp {
-            T_ANIM => p.animate(),
             T_DPI => p.flush_dpi_now(),
             T_LEAVE => {
                 KillTimer(p.hwnd, T_LEAVE);
@@ -982,6 +1049,10 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 p.close(); // при вводе имени Esc отменяет ввод (через WM_CHAR), а не закрывает панель
             }
         }),
+        WM_ANIM => {
+            anim_loop();
+            Some(())
+        }
         WM_LOADED => with(|p| p.loaded()),
         WM_CLOSE_PANEL => with(|p| p.close()),
         WM_ACTIVATE => {
@@ -1025,4 +1096,24 @@ fn save_names(names: &[String; 3]) {
     }
     let _ = std::fs::write(p, names.join("
 "));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // В конце анимации кадр — ровно снимок на своём месте; в начале — ничего
+    #[test]
+    fn genie_ends_as_snapshot() {
+        let (sw, sh, dw, dh) = (6usize, 5usize, 10usize, 12usize);
+        let src: Vec<u32> = (0..sw * sh).map(|i| 0xFF00_0000 | i as u32).collect();
+        let mut dst = vec![0u32; dw * dh];
+        assert_eq!(genie_frame(&mut dst, dw, &src, sw, (2.0, 3.0), (5.0, 11.0), 1.0), 255);
+        for y in 0..sh {
+            assert_eq!(&dst[(y + 3) * dw + 2..][..sw], &src[y * sw..][..sw]);
+        }
+        let mut dst = vec![0u32; dw * dh];
+        assert_eq!(genie_frame(&mut dst, dw, &src, sw, (2.0, 3.0), (5.0, 11.0), 0.0), 0);
+        assert!(dst.iter().all(|&p| p == 0));
+    }
 }
