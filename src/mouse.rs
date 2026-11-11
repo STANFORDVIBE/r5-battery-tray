@@ -17,6 +17,9 @@ pub const LODS: &[(u8, &str)] = &[(0x87, "0.7 мм"), (1, "1 мм"), (2, "2 мм
 pub const SLEEP_S: &[(u16, &str)] = &[(15, "15 с"), (30, "30 с"), (60, "1 мин"), (300, "5 мин"), (600, "10 мин")]; // мышь хранит секунды
 
 // Один запрос к мыши за раз: заряд (окно) и настройки (фоновый поток) иначе перепутают ответы
+// Мышь отвечает за пару мс: частый опрос — чтение всех настроек ~50 мс вместо ~200 (замерено на R5 Ultra через донгл)
+const POLL_MS: u64 = 5;
+
 pub static HID_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn lock() -> std::sync::MutexGuard<'static, ()> {
@@ -79,8 +82,8 @@ impl Dev {
             if !self.set(&req) {
                 return None;
             }
-            for _ in 0..12 {
-                thread::sleep(Duration::from_millis(25));
+            for _ in 0..300 / POLL_MS {
+                thread::sleep(Duration::from_millis(POLL_MS));
                 let r = self.get()?;
                 if r[1] == 0xA1 && r[6] == code {
                     return Some(r);
@@ -169,7 +172,8 @@ mod tests {
     fn read_live() {
         for p in crate::hid_paths() {
             if let Some(d) = Dev::open(&p) {
-                println!("{:?}", d.read());
+                let t = std::time::Instant::now();
+                println!("{:?} за {:?}", d.read(), t.elapsed());
             }
         }
     }

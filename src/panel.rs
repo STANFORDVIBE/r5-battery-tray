@@ -148,13 +148,14 @@ fn run(hwnd: HWND, job: Option<Job>) {
         }
         for p in paths {
             let Some(d) = Dev::open(&p) else { continue };
-            let Some(first) = d.read() else { continue };
+            // быстрая проверка, что на этом интерфейсе мышь отвечает, — без полного чтения перед записью
+            if d.cmd(1, 0, 0x85, &[]).is_none() {
+                continue;
+            }
             if let Some(j) = job.take() {
                 j(&d);
-                out.set = d.read().or(Some(first));
-            } else {
-                out.set = Some(first);
             }
+            out.set = d.read();
             out.battery = d.battery();
             out.wired = String::from_utf16_lossy(&p).to_ascii_lowercase().contains("pid_0046");
             *DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
