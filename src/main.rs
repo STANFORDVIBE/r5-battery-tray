@@ -3,6 +3,9 @@
 // Чистый Win32 без рантаймов: скрытое окно + Shell_NotifyIcon, опрос раз в 30 с.
 #![windows_subsystem = "windows"]
 
+mod mouse;
+mod panel;
+
 use std::{cell::RefCell, mem, ptr, thread, time::Duration};
 use windows_sys::Win32::{
     Devices::DeviceAndDriverInstallation::*,
@@ -70,6 +73,8 @@ fn main() {
         let tb = RegisterWindowMessageW(w("TaskbarCreated").as_ptr());
         ST.with(|s| { let mut s = s.borrow_mut(); s.hwnd = hwnd; s.taskbar_msg = tb; s.mutex = mutex; });
         remove_old_exe();
+        SetProcessDPIAware();
+        panel::init();
 
         update();
         notify(NIM_ADD);
@@ -88,7 +93,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_TIMER => { remove_old_exe(); update(); notify(NIM_MODIFY); }
         WM_TRAY => match lp as u32 {
-            WM_LBUTTONUP => { update(); notify(NIM_MODIFY); }
+            WM_LBUTTONUP => panel::toggle(),
             WM_RBUTTONUP => menu(hwnd),
             _ => {}
         },
@@ -171,6 +176,8 @@ fn notify(action: NOTIFY_ICON_MESSAGE) {
 // ---------- мышь ----------
 
 fn read_battery() -> Option<(u8, bool)> {
+    // панель сейчас говорит с мышью — не ждём её, иконка обновится в следующий раз
+    let Ok(_l) = mouse::HID_LOCK.try_lock() else { return None };
     let cached = ST.with(|s| s.borrow().good_path.clone());
     if let Some(p) = cached {
         if let Some(r) = query(&p) {
