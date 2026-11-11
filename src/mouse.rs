@@ -132,6 +132,8 @@ impl Dev {
     pub fn set_lod(&self, p: u8, code: u8) -> bool { self.cmd(2, 1, 0x08, &[p, code]).is_some() }
     pub fn set_motion_sync(&self, p: u8, on: bool) -> bool { self.cmd(2, 1, 0x09, &[p, on as u8]).is_some() }
     pub fn set_angle_snap(&self, p: u8, on: bool) -> bool { self.cmd(2, 1, 0x04, &[p, on as u8]).is_some() }
+    // Заводские настройки текущего профиля — кнопка «Сбросить профиль» драйвера (привязку донгла не трогает)
+    pub fn reset_profile(&self, p: u8) -> bool { self.cmd(1, 0, 0x0D, &[p]).is_some() }
     pub fn set_sleep(&self, p: u8, secs: u16) -> bool {
         let b = secs.to_be_bytes();
         self.cmd(3, 0, 0x07, &[p, b[0], b[1]]).is_some()

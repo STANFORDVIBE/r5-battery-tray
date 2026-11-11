@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 
 // ───── размеры (логические пиксели, умножаются на масштаб экрана) ─────
 const W: f32 = 360.0;
-const H: f32 = 500.0;
+const H: f32 = 552.0;
 const PAD: f32 = 20.0;
 const S: f32 = 16.0; // поле вокруг панели под тень
 const GAP: f32 = 12.0; // отступ от панели задач
@@ -45,6 +45,8 @@ const WM_CLOSE_PANEL: u32 = WM_APP + 11;
 const T_ANIM: usize = 1;
 const T_WATCH: usize = 2;
 const T_DPI: usize = 3; // запись DPI после прокрутки колёсика — с задержкой, одной командой
+const T_LEAVE: usize = 4; // курсор ушёл с панели — сворачиваем, если не вернулся
+const T_RESET: usize = 5; // «нажми ещё раз» на кнопке сброса гаснет само
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Act {
@@ -54,6 +56,7 @@ enum Act {
     Sleep(u16),
     Motion,
     Angle,
+    Reset,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +77,8 @@ struct Panel {
     // интерфейс
     hits: Vec<(RectF, Act)>,
     hover: Option<Act>,
+    entered: bool, // курсор уже побывал на панели — только тогда уход с неё сворачивает
+    reset_armed: bool,
     // анимация и место
     visible: bool,
     closing: bool,
@@ -190,7 +195,7 @@ pub fn init() {
 
         let p = Panel {
             hwnd, scale, set: None, battery: None, wired: false, status: Status::Loading,
-            hits: Vec::new(), hover: None, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
+            hits: Vec::new(), hover: None, entered: false, reset_armed: false, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
             genie: true, slide: (0.0, 1.0), snap: ptr::null_mut(), fg_at_open: ptr::null_mut(),
             dc: ptr::null_mut(), dib: ptr::null_mut(), old: ptr::null_mut(), bits: ptr::null_mut(), buf_w: 0, buf_h: 0,
@@ -228,6 +233,8 @@ impl Panel {
         self.place();
         self.closing = false;
         self.hover = None;
+        self.entered = false;
+        self.reset_armed = false;
         if self.status != Status::Ready {
             self.status = Status::Loading;
         }
@@ -377,7 +384,9 @@ impl Panel {
             return;
         }
         let h = self.hit(self.logical(lp));
+        self.entered = true;
         unsafe {
+            KillTimer(self.hwnd, T_LEAVE);
             SetCursor(LoadCursorW(ptr::null_mut(), if h.is_some() { IDC_HAND } else { IDC_ARROW }));
             let mut tme = TRACKMOUSEEVENT { cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
             TrackMouseEvent(&mut tme);
@@ -393,6 +402,13 @@ impl Panel {
             return;
         }
         let Some(act) = self.hit(self.logical(lp)) else { return };
+        if act == Act::Reset && !self.reset_armed {
+            // сброс — только со второго клика, чтобы не стереть настройки случайно
+            self.reset_armed = true;
+            unsafe { SetTimer(self.hwnd, T_RESET, 3000, None) };
+            self.render();
+            return;
+        }
         let Some(s) = self.set.as_mut() else { return };
         let p = s.profile;
         // меняем на экране сразу, запись — в фоне; после записи мышь перечитывается и покажет правду
@@ -417,6 +433,12 @@ impl Panel {
                 s.motion_sync = !s.motion_sync;
                 let on = s.motion_sync;
                 Box::new(move |d| { d.set_motion_sync(p, on); })
+            }
+            Act::Reset => {
+                self.reset_armed = false;
+                unsafe { KillTimer(self.hwnd, T_RESET) };
+                unsafe { KillTimer(self.hwnd, T_DPI) }; // недописанные DPI после сброса не нужны
+                Box::new(move |d| { d.reset_profile(p); })
             }
             Act::Angle => {
                 s.angle_snap = !s.angle_snap;
@@ -684,6 +706,15 @@ impl Panel {
             d.ellipse(if on { tx + 21.0 } else { tx + 3.0 }, ty + 3.0, 16.0, 16.0, FG);
             hits.push((row, act));
         }
+
+        // сброс к заводским
+        let r = rf(PAD, 500.0, W - 2.0 * PAD, 34.0);
+        let armed = self.reset_armed;
+        let bg = if armed { RED } else if hov == Some(Act::Reset) { CARD_HOVER } else { CARD };
+        d.round(r.X, r.Y, r.Width, r.Height, 10.0, bg);
+        let label = if armed { "Точно сбросить? Нажми ещё раз" } else { "Сбросить к заводским" };
+        d.text(label, 13.0, armed, FG, r, Align::Center);
+        hits.push((r, Act::Reset));
         self.hits = hits;
     }
 }
@@ -846,6 +877,15 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         WM_TIMER => with(|p| match wp {
             T_ANIM => p.animate(),
             T_DPI => p.flush_dpi_now(),
+            T_LEAVE => {
+                KillTimer(p.hwnd, T_LEAVE);
+                p.close();
+            }
+            T_RESET => {
+                KillTimer(p.hwnd, T_RESET);
+                p.reset_armed = false;
+                p.render();
+            }
             T_WATCH => {
                 let fg = GetForegroundWindow();
                 if p.visible && !p.closing && fg != p.hwnd && fg != p.fg_at_open {
@@ -856,6 +896,9 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         }),
         WM_MOUSEMOVE => with(|p| p.mouse_move(lp)),
         WM_MOUSELEAVE => with(|p| {
+            if p.entered && p.visible && !p.closing {
+                SetTimer(p.hwnd, T_LEAVE, 350, None); // мимолётный выход за край не считаем
+            }
             if p.hover.is_some() {
                 p.hover = None;
                 p.render();
@@ -887,3 +930,4 @@ impl Panel {
         self.flush_dpi();
     }
 }
+
