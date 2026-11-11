@@ -10,6 +10,7 @@ use windows_sys::Win32::{Devices::HumanInterfaceDevice::*, Foundation::*, Storag
 pub const DPI_MAX: u16 = 42000;
 pub const DPI_STEP: u16 = 50;
 pub const MAX_STAGES: usize = 6;
+pub const PROFILES: u8 = 3; // в драйвере три профиля
 pub const POLL_WIRED: &[u16] = &[125, 250, 500, 1000];
 pub const POLL_DONGLE: &[u16] = &[125, 250, 500, 1000, 2000, 4000, 8000];
 pub const LODS: &[(u8, &str)] = &[(0x87, "0.7 мм"), (1, "1 мм"), (2, "2 мм")]; // 0.7 мм драйвер шлёт как 7|0x80
@@ -132,6 +133,8 @@ impl Dev {
     pub fn set_lod(&self, p: u8, code: u8) -> bool { self.cmd(2, 1, 0x08, &[p, code]).is_some() }
     pub fn set_motion_sync(&self, p: u8, on: bool) -> bool { self.cmd(2, 1, 0x09, &[p, on as u8]).is_some() }
     pub fn set_angle_snap(&self, p: u8, on: bool) -> bool { self.cmd(2, 1, 0x04, &[p, on as u8]).is_some() }
+    // Сделать профиль активным: мышь сразу переходит на его настройки
+    pub fn set_profile(&self, p: u8) -> bool { self.cmd(1, 0, 0x05, &[p]).is_some() }
     // Заводские настройки текущего профиля — кнопка «Сбросить профиль» драйвера (привязку донгла не трогает)
     pub fn reset_profile(&self, p: u8) -> bool { self.cmd(1, 0, 0x0D, &[p]).is_some() }
     pub fn set_sleep(&self, p: u8, secs: u16) -> bool {
