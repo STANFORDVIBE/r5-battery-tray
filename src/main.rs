@@ -28,6 +28,7 @@ const ID_REFRESH: usize = 1;
 const ID_AUTORUN: usize = 2;
 const ID_EXIT: usize = 3;
 const ID_UPDATE: usize = 4;
+const ID_RESET: usize = 5;
 const REPO: &str = "STANFORDVIBE/r5-battery-tray";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -107,6 +108,7 @@ unsafe fn menu(hwnd: HWND) {
     let m = CreatePopupMenu();
     let auto = if autorun_get() { MF_CHECKED } else { MF_UNCHECKED };
     AppendMenuW(m, MF_STRING, ID_REFRESH, w("Обновить").as_ptr());
+    AppendMenuW(m, MF_STRING, ID_RESET, w("Вернуть заводские настройки…").as_ptr());
     AppendMenuW(m, MF_STRING | auto, ID_AUTORUN, w("Запускать с Windows").as_ptr());
     AppendMenuW(m, MF_STRING, ID_UPDATE, w(&format!("Проверить обновления (v{VERSION})")).as_ptr());
     AppendMenuW(m, MF_SEPARATOR, 0, ptr::null());
@@ -121,6 +123,14 @@ unsafe fn menu(hwnd: HWND) {
         ID_REFRESH => { update(); notify(NIM_MODIFY); }
         ID_AUTORUN => autorun_set(!autorun_get()),
         ID_UPDATE => check_update(hwnd),
+        ID_RESET => {
+            let ask = "Вернуть заводские настройки текущего профиля мыши?
+
+DPI, частота опроса, высота отрыва, сон и переключатели станут как с завода.";
+            if message(hwnd, ask, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES {
+                panel::factory_reset();
+            }
+        }
         ID_EXIT => { notify(NIM_DELETE); PostQuitMessage(0); }
         _ => {}
     }

@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 
 // ───── размеры (логические пиксели, умножаются на масштаб экрана) ─────
 const W: f32 = 360.0;
-const H: f32 = 518.0;
+const H: f32 = 498.0;
 const PAD: f32 = 20.0;
 const S: f32 = 16.0; // поле вокруг панели под тень
 const GAP: f32 = 12.0; // отступ от панели задач
@@ -46,7 +46,6 @@ const WM_ANIM: u32 = WM_APP + 12;
 const T_WATCH: usize = 2;
 const T_DPI: usize = 3; // запись DPI после прокрутки колёсика — с задержкой, одной командой
 const T_LEAVE: usize = 4; // курсор ушёл с панели — сворачиваем, если не вернулся
-const T_RESET: usize = 5; // «нажми ещё раз» на кнопке сброса гаснет само
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Act {
@@ -56,7 +55,6 @@ enum Act {
     Sleep(u16),
     Motion,
     Angle,
-    Reset,
     Profile(u8), // сделать профиль активным (кнопка «›»)
     Name,        // имя профиля: двойной клик — переименовать
 }
@@ -80,7 +78,6 @@ struct Panel {
     hits: Vec<(RectF, Act)>,
     hover: Option<Act>,
     entered: bool, // курсор уже побывал на панели — только тогда уход с неё сворачивает
-    reset_armed: bool,
     names: [String; 3],                  // свои имена профилей, хранятся на компе
     editing: Option<(usize, String)>,
     cache: [Option<Settings>; 3],        // настройки всех профилей: переключение показывается сразу, мышь догоняет в фоне    // переименовываем профиль: номер с нуля и набранный текст
@@ -210,7 +207,7 @@ pub fn init() {
 
         let p = Panel {
             hwnd, scale, set: None, battery: None, wired: false, status: Status::Loading,
-            hits: Vec::new(), hover: None, entered: false, reset_armed: false, names: load_names(), editing: None, cache: [None, None, None], visible: false, closing: false, progress: 0.0, anim_from: 0.0,
+            hits: Vec::new(), hover: None, entered: false, names: load_names(), editing: None, cache: [None, None, None], visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
             genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, fg_at_open: ptr::null_mut(),
             dc: ptr::null_mut(), dib: ptr::null_mut(), old: ptr::null_mut(), bits: ptr::null_mut(), buf_w: 0, buf_h: 0,
@@ -249,6 +246,18 @@ pub fn hide_now() {
     });
 }
 
+// Заводские настройки текущего профиля — пункт меню трея. Панель (если открыта) покажет новые значения сама
+pub fn factory_reset() {
+    with(|p| {
+        unsafe { KillTimer(p.hwnd, T_DPI) }; // недописанные DPI после сброса не нужны
+        run(p.hwnd, Some(Box::new(|d| {
+            if let Some(r) = d.cmd(1, 0, 0x85, &[]) {
+                d.reset_profile(r[7].max(1));
+            }
+        })));
+    });
+}
+
 pub fn toggle() {
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
@@ -271,7 +280,6 @@ impl Panel {
         self.closing = false;
         self.hover = None;
         self.entered = false;
-        self.reset_armed = false;
         if self.status != Status::Ready {
             self.status = Status::Loading;
         }
@@ -460,13 +468,6 @@ impl Panel {
             self.switch_profile(n);
             return;
         }
-        if act == Act::Reset && !self.reset_armed {
-            // сброс — только со второго клика, чтобы не стереть настройки случайно
-            self.reset_armed = true;
-            unsafe { SetTimer(self.hwnd, T_RESET, 3000, None) };
-            self.render();
-            return;
-        }
         let Some(s) = self.set.as_mut() else { return };
         let p = s.profile;
 
@@ -494,12 +495,6 @@ impl Panel {
                 Box::new(move |d| { d.set_motion_sync(p, on); })
             }
             Act::Profile(_) | Act::Name => return,
-            Act::Reset => {
-                self.reset_armed = false;
-                unsafe { KillTimer(self.hwnd, T_RESET) };
-                unsafe { KillTimer(self.hwnd, T_DPI) }; // недописанные DPI после сброса не нужны
-                Box::new(move |d| { d.reset_profile(p); })
-            }
             Act::Angle => {
                 s.angle_snap = !s.angle_snap;
                 let on = s.angle_snap;
@@ -815,20 +810,6 @@ impl Panel {
             hits.push((row, act));
         }
 
-        // сброс к заводским: крошечная ↺ в правом нижнем углу; клик — на её месте красный вопрос, клик по нему — сброс
-        let armed = self.reset_armed;
-        let hot = hov == Some(Act::Reset);
-        let y = 494.0;
-        let r = if armed {
-            let q = "Вернуть к заводским настройкам?";
-            let tw = d.measure(q, 11.0, true);
-            d.text(q, 11.0, true, RED, rf(W - PAD - 250.0, y, 250.0, 16.0), Align::Right);
-            rf(W - PAD - tw - 4.0, y - 2.0, tw + 8.0, 20.0)
-        } else {
-            d.reset_icon(W - PAD - 6.0, y + 8.0, 3.5, if hot { RED } else { MUTED });
-            rf(W - PAD - 14.0, y - 2.0, 18.0, 20.0)
-        };
-        hits.push((r, Act::Reset));
         self.hits = hits;
     }
 }
@@ -914,33 +895,6 @@ impl Draw<'_> {
             let mut b = ptr::null_mut();
             GdipCreateSolidFill(c, &mut b);
             GdipFillEllipse(self.g, b as *mut GpBrush, x, y, w, h);
-            GdipDeleteBrush(b as *mut GpBrush);
-        }
-    }
-
-    // Значок «вернуть»: дуга со стрелкой, рисуем сами — в Segoe UI такого символа может не быть
-    fn reset_icon(&self, cx: f32, cy: f32, rad: f32, c: u32) {
-        let k = rad / 6.0; // наконечник и толщина — в масштабе значка
-        let (start, sweep) = (-60.0f32, -280.0f32); // против часовой, разрыв сверху справа
-        unsafe {
-            let mut pen = ptr::null_mut();
-            GdipCreatePen1(c, (1.7 * k).max(1.2), UnitWorld, &mut pen);
-            GdipSetPenStartCap(pen, LineCapRound);
-            GdipDrawArc(self.g, pen, cx - rad, cy - rad, 2.0 * rad, 2.0 * rad, start, sweep);
-            GdipDeletePen(pen);
-            // наконечник на конце дуги, по касательной в сторону движения
-            let a = (start + sweep).to_radians();
-            let (px, py) = (cx + rad * a.cos(), cy + rad * a.sin());
-            let (dx, dy) = (a.sin(), -a.cos()); // касательная при обходе против часовой
-            let (nx, ny) = (a.cos(), a.sin());
-            let pts = [
-                PointF { X: px + dx * 3.2 * k, Y: py + dy * 3.2 * k },
-                PointF { X: px - dx * k + nx * 3.0 * k, Y: py - dy * k + ny * 3.0 * k },
-                PointF { X: px - dx * k - nx * 3.0 * k, Y: py - dy * k - ny * 3.0 * k },
-            ];
-            let mut b = ptr::null_mut();
-            GdipCreateSolidFill(c, &mut b);
-            GdipFillPolygon(self.g, b as *mut GpBrush, pts.as_ptr(), 3, FillModeAlternate);
             GdipDeleteBrush(b as *mut GpBrush);
         }
     }
@@ -1122,11 +1076,6 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             T_LEAVE => {
                 KillTimer(p.hwnd, T_LEAVE);
                 p.close();
-            }
-            T_RESET => {
-                KillTimer(p.hwnd, T_RESET);
-                p.reset_armed = false;
-                p.render();
             }
             T_WATCH => {
                 let fg = GetForegroundWindow();
