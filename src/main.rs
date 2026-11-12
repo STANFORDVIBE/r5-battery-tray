@@ -6,13 +6,12 @@
 mod mouse;
 mod panel;
 
-use std::{cell::RefCell, mem, ptr, thread, time::Duration};
+use std::{cell::RefCell, mem, ptr, thread};
 use windows_sys::Win32::{
     Devices::DeviceAndDriverInstallation::*,
     Devices::HumanInterfaceDevice::*,
     Foundation::*,
     Graphics::Gdi::*,
-    Storage::FileSystem::*,
     System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW},
     System::Registry::*,
     System::Threading::CreateMutexW,
@@ -24,6 +23,7 @@ use windows_sys::Win32::{
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
+const WM_BATTERY: u32 = WM_APP + 2; // заряд прочитан в фоне: wparam = процент | зарядка << 8 | ответила << 9
 const ID_REFRESH: usize = 1;
 const ID_AUTORUN: usize = 2;
 const ID_EXIT: usize = 3;
@@ -39,16 +39,15 @@ struct State {
     icon: HICON,
     tip: String,
     last_tip: Option<String>, // последний удачный ответ: спящая мышь заряд не отдаёт, держим старый
-    good_path: Option<Vec<u16>>, // интерфейс, который уже ответил, чтобы не перебирать каждый раз
     taskbar_msg: u32,
     mutex: HANDLE, // отпускаем перед перезапуском после обновления, иначе новая копия решит, что уже запущена
 }
 
 thread_local! {
-    static ST: RefCell<State> = RefCell::new(State {
+    static ST: RefCell<State> = const { RefCell::new(State {
         hwnd: ptr::null_mut(), icon: ptr::null_mut(), tip: String::new(),
-        last_tip: None, good_path: None, taskbar_msg: 0, mutex: ptr::null_mut(),
-    });
+        last_tip: None, taskbar_msg: 0, mutex: ptr::null_mut(),
+    }) };
 }
 
 fn w(s: &str) -> Vec<u16> {
@@ -77,8 +76,13 @@ fn main() {
         SetProcessDPIAware();
         panel::init();
 
-        update();
+        ST.with(|s| {
+            let mut s = s.borrow_mut();
+            set_icon(&mut s, make_icon(0, false));
+            s.tip = "R5 Ultra: ищу мышь…".into();
+        });
         notify(NIM_ADD);
+        read_battery(hwnd);
         SetTimer(hwnd, 1, 30_000, None);
 
         let mut msg: MSG = mem::zeroed();
@@ -92,7 +96,8 @@ fn main() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let tb = ST.with(|s| s.borrow().taskbar_msg);
     match msg {
-        WM_TIMER => { remove_old_exe(); update(); notify(NIM_MODIFY); }
+        WM_TIMER => { remove_old_exe(); read_battery(hwnd); }
+        WM_BATTERY => { update(((wp >> 9) & 1 != 0).then_some((wp as u8, (wp >> 8) & 1 != 0))); notify(NIM_MODIFY); }
         WM_TRAY => match lp as u32 {
             WM_LBUTTONUP => panel::toggle(),
             WM_RBUTTONUP => { panel::hide_now(); menu(hwnd) } // меню стопорит программу — анимация застыла бы на полпути
@@ -120,7 +125,7 @@ unsafe fn menu(hwnd: HWND) {
     PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
     match cmd as usize {
-        ID_REFRESH => { update(); notify(NIM_MODIFY); }
+        ID_REFRESH => read_battery(hwnd),
         ID_AUTORUN => autorun_set(!autorun_get()),
         ID_UPDATE => check_update(hwnd),
         ID_RESET => {
@@ -136,9 +141,8 @@ DPI, частота опроса, высота отрыва, сон и пере�
     }
 }
 
-// Читает заряд и готовит иконку/подсказку в State; показывает их notify().
-fn update() {
-    let r = read_battery();
+// Готовит иконку/подсказку по заряду в State; показывает их notify().
+fn update(r: Option<(u8, bool)>) {
     ST.with(|s| {
         let mut s = s.borrow_mut();
         match r {
@@ -185,23 +189,20 @@ fn notify(action: NOTIFY_ICON_MESSAGE) {
 
 // ---------- мышь ----------
 
-fn read_battery() -> Option<(u8, bool)> {
-    // панель сейчас говорит с мышью — не ждём её, иконка обновится в следующий раз
-    let Ok(_l) = mouse::HID_LOCK.try_lock() else { return None };
-    let cached = ST.with(|s| s.borrow().good_path.clone());
-    if let Some(p) = cached {
-        if let Some(r) = query(&p) {
-            return Some(r);
-        }
-    }
-    for p in hid_paths() {
-        if let Some(r) = query(&p) {
-            ST.with(|s| s.borrow_mut().good_path = Some(p));
-            return Some(r);
-        }
-    }
-    ST.with(|s| s.borrow_mut().good_path = None);
-    None
+// Заряд читаем в фоне: спящая мышь отвечает не сразу, а окно в это время должно жить
+fn read_battery(hwnd: HWND) {
+    let hwnd = hwnd as isize;
+    thread::spawn(move || {
+        // панель сейчас говорит с мышью — не ждём её, иконка обновится в следующий раз
+        let Ok(_l) = mouse::HID_LOCK.try_lock() else { return };
+        let r = mouse::paths().into_iter().find_map(|p| {
+            let r = mouse::Dev::open(&p)?.battery()?;
+            mouse::remember(&p);
+            Some(r)
+        });
+        let wp = r.map_or(0, |(pct, ch)| pct as usize | (ch as usize) << 8 | 1 << 9);
+        unsafe { PostMessageW(hwnd as HWND, WM_BATTERY, wp, 0) };
+    });
 }
 
 // Пути всех HID-интерфейсов мыши (донгл и провод).
@@ -248,41 +249,6 @@ fn hid_paths() -> Vec<Vec<u16>> {
         SetupDiDestroyDeviceInfoList(set);
     }
     out
-}
-
-fn query(path: &[u16]) -> Option<(u8, bool)> {
-    unsafe {
-        let h = CreateFileW(path.as_ptr(), 0xC000_0000, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ptr::null(), OPEN_EXISTING, 0, ptr::null_mut());
-        if h == INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let mut req = [0u8; 65];
-        req[3] = 0x02;
-        req[4] = 0x02;
-        req[6] = 0x83;
-        let mut result = None;
-        if HidD_SetFeature(h, req.as_ptr() as _, 65) != 0 {
-            // A0 = донгл ещё ждёт мышь (или она спит) — немного подождём
-            for _ in 0..6 {
-                thread::sleep(Duration::from_millis(60));
-                let mut res = [0u8; 65];
-                if HidD_GetFeature(h, res.as_mut_ptr() as _, 65) == 0 {
-                    break;
-                }
-                if let Some(r) = parse(&res) {
-                    result = Some(r);
-                    break;
-                }
-            }
-        }
-        CloseHandle(h);
-        result
-    }
-}
-
-fn parse(res: &[u8; 65]) -> Option<(u8, bool)> {
-    (res[1] == 0xA1 && res[4] == 0x02 && res[6] == 0x83 && res[8] <= 100).then(|| (res[8], res[7] != 0))
 }
 
 // ---------- иконка ----------
@@ -559,17 +525,6 @@ mod tests {
         assert!(newer("v0.10.0", "0.9.9"));
         assert!(!newer("v0.2.0", "0.2.0"));
         assert!(!newer("v0.1.5", "0.2.0"));
-    }
-
-    #[test]
-    fn parses_battery_reply() {
-        let mut r = [0u8; 65];
-        r[1] = 0xA1; r[3] = 2; r[4] = 2; r[6] = 0x83; r[8] = 69;
-        assert_eq!(parse(&r), Some((69, false)));
-        r[7] = 1;
-        assert_eq!(parse(&r), Some((69, true)));
-        r[1] = 0xA0; // мышь спит
-        assert_eq!(parse(&r), None);
     }
 
     // Превью всех состояний на тёмном фоне трея: cargo test preview -- --ignored, смотреть preview.bmp

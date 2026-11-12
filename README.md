@@ -15,8 +15,7 @@
 
 Нужен [Rust](https://rustup.rs). `build.bat` соберёт и положит `R5BatteryTray.exe` рядом. Тесты: `cargo test`, чтение настроек с мыши: `cargo test read_live -- --ignored --nocapture`, панель без мыши (подставные данные): запустить с переменной `R5_FAKE=1`, превью иконки во всех размерах: `cargo test preview -- --ignored` (`preview.bmp`).
 
-Новая версия: поднять `version` в `Cargo.toml` → `build.bat` → `scripts\sign-release.ps1` → тег `v<версия>` → релиз с файлами `R5BatteryTray.exe` и `R5BatteryTray.exe.sig` (именно так, их качает обновлялка). Закрытый ключ лежит в `%USERPROFILE%\.r5batterytray
-elease.key`, зашифрованный паролем (скрипт спрашивает его при подписи). Держи копию файла: без него и пароля обновления по кнопке не выпустить.
+Новая версия: поднять `version` в `Cargo.toml` → `build.bat` → `scripts\sign-release.ps1` → тег `v<версия>` → релиз с файлами `R5BatteryTray.exe` и `R5BatteryTray.exe.sig` (именно так, их качает обновлялка). Закрытый ключ лежит в `%USERPROFILE%\.r5batterytray\release.key`, зашифрованный паролем (скрипт спрашивает его при подписи). Держи копию файла: без него и пароля обновления по кнопке не выпустить.
 
 ## Протокол
 

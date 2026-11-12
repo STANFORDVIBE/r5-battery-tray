@@ -26,6 +26,21 @@ pub fn lock() -> std::sync::MutexGuard<'static, ()> {
     HID_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// Интерфейс, на котором мышь ответила в прошлый раз, — его пробуем первым
+static DEV_PATH: std::sync::Mutex<Option<Vec<u16>>> = std::sync::Mutex::new(None);
+
+pub fn paths() -> Vec<Vec<u16>> {
+    let mut paths = crate::hid_paths();
+    if let Some(p) = DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        paths.insert(0, p);
+    }
+    paths
+}
+
+pub fn remember(p: &[u16]) {
+    *DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.to_vec());
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     pub profile: u8,
@@ -72,12 +87,7 @@ impl Dev {
 
     // Отправить и дождаться ответа A1 с тем же кодом команды — как retrySetGet в драйвере
     pub fn cmd(&self, len: u8, sub: u8, code: u8, data: &[u8]) -> Option<[u8; 65]> {
-        let mut req = [0u8; 65];
-        req[3] = 2;
-        req[4] = len;
-        req[5] = sub;
-        req[6] = code;
-        req[7..7 + data.len()].copy_from_slice(data);
+        let req = request(len, sub, code, data);
         for _ in 0..4 {
             if !self.set(&req) {
                 return None;
@@ -126,14 +136,8 @@ impl Dev {
         self.cmd(2, 1, 0x02, &[p, stage as u8 + 1]).is_some()
     }
 
-    // Все ступени разом: X и Y одинаковые, 4 байта на ступень
     pub fn set_stages(&self, p: u8, stages: &[u16]) -> bool {
-        let mut d = vec![p, stages.len() as u8];
-        for &v in stages {
-            let v = clamp_dpi(v as i32).to_be_bytes();
-            d.extend([v[0], v[1], v[0], v[1]]);
-        }
-        self.cmd(26, 1, 0x01, &d).is_some()
+        self.cmd(26, 1, 0x01, &stages_data(p, stages)).is_some()
     }
 
     pub fn set_poll(&self, p: u8, hz: u16) -> bool { self.cmd(2, 1, 0x00, &[p, poll_code(hz)]).is_some() }
@@ -148,6 +152,26 @@ impl Dev {
         let b = secs.to_be_bytes();
         self.cmd(3, 0, 0x07, &[p, b[0], b[1]]).is_some()
     }
+}
+
+fn request(len: u8, sub: u8, code: u8, data: &[u8]) -> [u8; 65] {
+    let mut req = [0u8; 65];
+    req[3] = 2;
+    req[4] = len;
+    req[5] = sub;
+    req[6] = code;
+    req[7..7 + data.len()].copy_from_slice(data);
+    req
+}
+
+// Все ступени разом: X и Y одинаковые, 4 байта на ступень
+fn stages_data(p: u8, stages: &[u16]) -> Vec<u8> {
+    let mut d = vec![p, stages.len() as u8];
+    for &v in stages {
+        let v = clamp_dpi(v as i32).to_be_bytes();
+        d.extend([v[0], v[1], v[0], v[1]]);
+    }
+    d
 }
 
 // DPI кратно 50, от 50 до максимума — как округляет драйвер
@@ -168,6 +192,18 @@ mod tests {
         assert_eq!(clamp_dpi(1625), 1600);
         assert_eq!(clamp_dpi(0), 50);
         assert_eq!(clamp_dpi(99999), DPI_MAX);
+    }
+
+    // Байты, которые уходят в мышь: ошибка здесь записала бы мыши мусор
+    #[test]
+    fn packets_layout() {
+        let r = request(2, 0, 0x83, &[]);
+        assert_eq!(r[..8], [0, 0, 0, 2, 2, 0, 0x83, 0]); // запрос заряда из шапки main.rs
+        let r = request(2, 1, 0x02, &[3, 2]);
+        assert_eq!(r[..9], [0, 0, 0, 2, 2, 1, 0x02, 3, 2]);
+        assert!(r[9..].iter().all(|&b| b == 0));
+        assert_eq!(stages_data(1, &[800, 1625]), [1, 2, 0x03, 0x20, 0x03, 0x20, 0x06, 0x40, 0x06, 0x40]);
+        assert_eq!(stages_data(1, &[50; MAX_STAGES]).len(), 26); // длина 26 в set_stages
     }
 
     // Только чтение с настоящей мыши: cargo test read_live -- --ignored --nocapture

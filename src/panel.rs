@@ -79,8 +79,9 @@ struct Panel {
     hover: Option<Act>,
     entered: bool, // курсор уже побывал на панели — только тогда уход с неё сворачивает
     names: [String; 3],                  // свои имена профилей, хранятся на компе
-    editing: Option<(usize, String)>,
-    cache: [Option<Settings>; 3],        // настройки всех профилей: переключение показывается сразу, мышь догоняет в фоне    // переименовываем профиль: номер с нуля и набранный текст
+    editing: Option<(usize, String)>,    // переименовываем профиль: номер с нуля и набранный текст
+    cache: [Option<Settings>; 3],        // настройки всех профилей: переключение показывается сразу, мышь догоняет в фоне
+    confirmed: Option<Settings>,         // что мышь сказала в последний раз — к этому откатываемся, если запись не дошла
     // анимация и место
     visible: bool,
     closing: bool,
@@ -125,7 +126,6 @@ struct Loaded {
 }
 static RESULT: Mutex<Option<Loaded>> = Mutex::new(None);
 static SEQ: AtomicU64 = AtomicU64::new(0);
-static DEV_PATH: Mutex<Option<Vec<u16>>> = Mutex::new(None);
 
 type Job = Box<dyn FnOnce(&Dev) + Send>;
 
@@ -137,12 +137,9 @@ fn run(hwnd: HWND, job: Option<Job>) {
     thread::spawn(move || {
         let _l = mouse::lock();
         let mut out = Loaded { seq, set: None, battery: None, wired: false, others: Vec::new() };
-        let mut paths = crate::hid_paths();
-        if let Some(p) = DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            paths.insert(0, p);
-        }
+        let mut paths = mouse::paths();
         let mut job = job;
-        if std::env::var_os("R5_FAKE").is_some() {
+        if cfg!(debug_assertions) && std::env::var_os("R5_FAKE").is_some() {
             // только для скриншотов без мыши: подставные настройки
             paths.clear();
             out.set = Some(Settings { profile: 1, stages: vec![1200, 2400, 3200, 5600, 8000, 42000], active: 1, poll: 1000, lod: 1, sleep_s: 60, motion_sync: true, angle_snap: false });
@@ -165,7 +162,7 @@ fn run(hwnd: HWND, job: Option<Job>) {
             }
             out.battery = d.battery();
             out.wired = String::from_utf16_lossy(&p).to_ascii_lowercase().contains("pid_0046");
-            *DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+            mouse::remember(&p);
             break;
         }
         *RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
@@ -207,7 +204,7 @@ pub fn init() {
 
         let p = Panel {
             hwnd, scale, set: None, battery: None, wired: false, status: Status::Loading,
-            hits: Vec::new(), hover: None, entered: false, names: load_names(), editing: None, cache: [None, None, None], visible: false, closing: false, progress: 0.0, anim_from: 0.0,
+            hits: Vec::new(), hover: None, entered: false, names: load_names(), editing: None, cache: [None, None, None], confirmed: None, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
             genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, fg_at_open: ptr::null_mut(),
             dc: ptr::null_mut(), dib: ptr::null_mut(), old: ptr::null_mut(), bits: ptr::null_mut(), buf_w: 0, buf_h: 0,
@@ -223,7 +220,6 @@ fn with<R>(f: impl FnOnce(&mut Panel) -> R) -> Option<R> {
 
 // ───── открыть / закрыть ─────
 
-// Клик по иконке: открыть или спрятать
 // Спрятать сразу, без анимации: перед меню трея (его модальный цикл остановил бы кадры)
 pub fn hide_now() {
     with(|p| {
@@ -258,6 +254,7 @@ pub fn factory_reset() {
     });
 }
 
+// Клик по иконке: открыть или спрятать
 pub fn toggle() {
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
@@ -581,7 +578,21 @@ impl Panel {
 
     fn loaded(&mut self) {
         let Some(r) = RESULT.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
-        if r.seq != SEQ.load(Ordering::SeqCst) {
+        let fresh = r.seq == SEQ.load(Ordering::SeqCst);
+        // профили в запас кладём и из устаревшего ответа: иначе быстрый «›» сразу после открытия покажет чужие цифры
+        let mut shown = false;
+        for s in r.others.iter().chain(&r.set) {
+            let i = (s.profile as usize).clamp(1, 3) - 1;
+            if !fresh && self.cache[i].is_none() && self.set.as_ref().is_some_and(|c| c.profile == s.profile) {
+                self.set = Some(s.clone()); // на экране была догадка — теперь настоящие цифры
+                shown = true;
+            }
+            self.cache[i] = Some(s.clone());
+        }
+        if !fresh {
+            if shown {
+                self.redraw();
+            }
             return; // пока читали, пользователь уже кликнул ещё — ждём свежий ответ
         }
         if unsafe { KillTimer(self.hwnd, T_DPI) } != 0 {
@@ -589,17 +600,20 @@ impl Panel {
             return;
         }
         self.status = if r.set.is_some() { Status::Ready } else { Status::NoMouse };
-        for s in r.others.into_iter().chain(r.set.clone()) {
-            let i = (s.profile as usize).clamp(1, 3) - 1;
-            self.cache[i] = Some(s);
-        }
         if r.set.is_some() {
+            self.confirmed = r.set.clone();
             self.set = r.set;
             self.wired = r.wired;
+        } else if self.confirmed.is_some() {
+            self.set = self.confirmed.clone(); // запись не дошла — показываем то, что в мыши на самом деле
         }
         if r.battery.is_some() {
             self.battery = r.battery;
         }
+        self.redraw();
+    }
+
+    fn redraw(&mut self) {
         if !self.snap.is_empty() {
             self.take_snap(); // данные пришли посреди анимации — следующий кадр уже с ними, без скачка в конце
         } else if self.visible && !self.animating() {
@@ -648,21 +662,20 @@ impl Panel {
             let mut g = ptr::null_mut();
             GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut g);
             GdipGraphicsClear(g, 0);
-            let alpha;
-            if !self.snap.is_empty() {
+            let alpha = if !self.snap.is_empty() {
                 let pr = self.panel_rc;
                 let dst = std::slice::from_raw_parts_mut(self.bits as *mut u32, (w * h) as usize);
-                alpha = genie_frame(dst, w as usize, &self.snap, self.snap_w,
+                genie_frame(dst, w as usize, &self.snap, self.snap_w,
                     ((pr.left - r.left) as f32, (pr.top - r.top) as f32),
-                    ((self.anchor.x - r.left) as f32, (self.anchor.y - r.top) as f32), self.progress);
+                    ((self.anchor.x - r.left) as f32, (self.anchor.y - r.top) as f32), self.progress)
             } else {
                 let e = 1.0 - (1.0 - self.progress).powi(3);
                 let (dx, dy) = (self.slide.0 * SLIDE * (1.0 - e), self.slide.1 * SLIDE * (1.0 - e));
                 GdipScaleWorldTransform(g, self.scale, self.scale, MatrixOrderPrepend);
                 GdipTranslateWorldTransform(g, S + dx, S + dy, MatrixOrderPrepend);
                 self.draw_all(g);
-                alpha = (255.0 * e) as u8;
-            }
+                (255.0 * e) as u8
+            };
             GdipDeleteGraphics(g);
             GdipDisposeImage(bmp as *mut GpImage);
 
@@ -974,7 +987,7 @@ fn genie_frame(dst: &mut [u32], dw: usize, src: &[u32], sw: usize, (px, py): (f3
         let x0 = l.floor().max(0.0) as usize;
         let x1 = (r.ceil().max(0.0) as usize).min(dw);
         let out = &mut dst[y * dw..][..dw];
-        for x in x0..x1 {
+        for (x, px) in out.iter_mut().enumerate().take(x1).skip(x0) {
             let xc = x as f32 + 0.5;
             let cover = clamp01((xc + 0.5).min(r) - (xc - 0.5).max(l)); // сглаживание краёв воронки
             if cover <= 0.0 {
@@ -983,7 +996,7 @@ fn genie_frame(dst: &mut [u32], dw: usize, src: &[u32], sw: usize, (px, py): (f3
             let sx = ((xc - l) * k - 0.5).clamp(0.0, pw - 1.0);
             let (sx0, fx) = (sx as usize, sx.fract());
             let sx1 = (sx0 + 1).min(sw - 1);
-            out[x] = mix4(row0[sx0], row0[sx1], row1[sx0], row1[sx1], fx, fy, cover);
+            *px = mix4(row0[sx0], row0[sx1], row1[sx0], row1[sx1], fx, fy, cover);
         }
     }
     (255.0 * clamp01(t / 0.12)) as u8
@@ -1072,7 +1085,7 @@ unsafe fn anim_loop() {
 unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let done = match msg {
         WM_TIMER => with(|p| match wp {
-            T_DPI => p.flush_dpi_now(),
+            T_DPI => p.flush_dpi(),
             T_LEAVE => {
                 KillTimer(p.hwnd, T_LEAVE);
                 p.close();
@@ -1123,13 +1136,6 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         return 0;
     }
     DefWindowProcW(hwnd, msg, wp, lp)
-}
-
-impl Panel {
-    // таймер дописи DPI сработал — запись уже ничего не ждёт
-    fn flush_dpi_now(&mut self) {
-        self.flush_dpi();
-    }
 }
 
 
