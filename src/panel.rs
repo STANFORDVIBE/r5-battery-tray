@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 
 // ───── размеры (логические пиксели, умножаются на масштаб экрана) ─────
 const W: f32 = 360.0;
-const H: f32 = 538.0;
+const H: f32 = 498.0;
 const PAD: f32 = 20.0;
 const S: f32 = 16.0; // поле вокруг панели под тень
 const GAP: f32 = 12.0; // отступ от панели задач
@@ -815,15 +815,15 @@ impl Panel {
             hits.push((row, act));
         }
 
-        // сброс к заводским: маленькая кнопка ↺ внизу по центру; подпись появляется при наведении, сброс — со второго клика
+        // сброс к заводским: маленькая кнопка ↺ справа под зарядом; подпись под ней при наведении, сброс — со второго клика
         let armed = self.reset_armed;
         let hot = hov == Some(Act::Reset);
-        let r = rf(W / 2.0 - 14.0, 494.0, 28.0, 28.0);
-        d.round(r.X, r.Y, r.Width, r.Height, 14.0, if armed { RED } else if hot { CARD_HOVER } else { CARD });
-        d.reset_icon(W / 2.0, r.Y + 14.0, if armed { FG } else if hot { RED } else { MUTED });
+        let r = rf(W - PAD - 24.0, 40.0, 24.0, 24.0);
+        d.round(r.X, r.Y, r.Width, r.Height, 12.0, if armed { RED } else if hot { CARD_HOVER } else { CARD });
+        d.reset_icon(r.X + 12.0, r.Y + 12.0, if armed { FG } else if hot { RED } else { MUTED });
         if armed || hot {
             let label = if armed { "Нажми ещё раз — сброшу" } else { "Заводские настройки" };
-            d.text(label, 11.0, armed, if armed { RED } else { MUTED }, rf(r.X + r.Width + 8.0, r.Y + 6.0, 150.0, 16.0), Align::Left);
+            d.text(label, 11.0, armed, if armed { RED } else { MUTED }, rf(W - PAD - 200.0, 67.0, 200.0, 16.0), Align::Right);
         }
         hits.push((r, Act::Reset));
         self.hits = hits;
