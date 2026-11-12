@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 
 // ───── размеры (логические пиксели, умножаются на масштаб экрана) ─────
 const W: f32 = 360.0;
-const H: f32 = 552.0;
+const H: f32 = 530.0;
 const PAD: f32 = 20.0;
 const S: f32 = 16.0; // поле вокруг панели под тень
 const GAP: f32 = 12.0; // отступ от панели задач
@@ -790,13 +790,13 @@ impl Panel {
             hits.push((row, act));
         }
 
-        // сброс к заводским
-        let r = rf(PAD, 500.0, W - 2.0 * PAD, 34.0);
+        // сброс к заводским: тихая ссылка внизу, краснеет при наведении; сброс — со второго клика
         let armed = self.reset_armed;
-        let bg = if armed { RED } else if hov == Some(Act::Reset) { CARD_HOVER } else { CARD };
-        d.round(r.X, r.Y, r.Width, r.Height, 10.0, bg);
-        let label = if armed { "Точно сбросить? Нажми ещё раз" } else { "Сбросить к заводским" };
-        d.text(label, 13.0, armed, FG, r, Align::Center);
+        let label = if armed { "Нажми ещё раз — сброшу" } else { "Сбросить к заводским" };
+        let tw = d.measure(label, 12.0, armed);
+        let r = rf((W - tw) / 2.0 - 8.0, 494.0, tw + 16.0, 24.0);
+        let c = if armed || hov == Some(Act::Reset) { RED } else { MUTED };
+        d.text(label, 12.0, armed, c, rf(0.0, r.Y + 3.0, W, 18.0), Align::Center);
         hits.push((r, Act::Reset));
         self.hits = hits;
     }
