@@ -32,6 +32,7 @@ const ID_RESET: usize = 5;
 const REPO: &str = "STANFORDVIBE/r5-battery-tray";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const STARTUP_APPROVED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 const APP: &str = "R5BatteryTray";
 
 struct State {
@@ -73,6 +74,7 @@ fn main() {
         let tb = RegisterWindowMessageW(w("TaskbarCreated").as_ptr());
         ST.with(|s| { let mut s = s.borrow_mut(); s.hwnd = hwnd; s.taskbar_msg = tb; s.mutex = mutex; });
         remove_old_exe();
+        autorun_fix_path();
         SetProcessDPIAware();
         panel::init();
 
@@ -183,7 +185,11 @@ fn notify(action: NOTIFY_ICON_MESSAGE) {
         for (d, c) in nid.szTip.iter_mut().zip(s.tip.encode_utf16().take(127)) {
             *d = c;
         }
-        Shell_NotifyIconW(action, &nid);
+        // при автозапуске панель задач бывает ещё не готова и NIM_ADD молча не проходит —
+        // тогда иконку добавляем при следующем обновлении заряда
+        if Shell_NotifyIconW(action, &nid) == 0 && action == NIM_MODIFY {
+            Shell_NotifyIconW(NIM_ADD, &nid);
+        }
     });
 }
 
@@ -463,16 +469,46 @@ fn newer(tag: &str, current: &str) -> bool {
 
 // ---------- автозапуск ----------
 
-fn autorun_get() -> bool {
+// Сырое значение из HKCU\<key>; None — нет
+fn reg_read(key: &str, name: &str) -> Option<Vec<u8>> {
     unsafe {
         let mut k: HKEY = ptr::null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, w(RUN_KEY).as_ptr(), 0, KEY_QUERY_VALUE, &mut k) != ERROR_SUCCESS {
-            return false;
+        if RegOpenKeyExW(HKEY_CURRENT_USER, w(key).as_ptr(), 0, KEY_QUERY_VALUE, &mut k) != ERROR_SUCCESS {
+            return None;
         }
-        let ok = RegQueryValueExW(k, w(APP).as_ptr(), ptr::null(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut())
-            == ERROR_SUCCESS;
+        let mut buf = vec![0u8; 4096];
+        let mut n = buf.len() as u32;
+        let ok = RegQueryValueExW(k, w(name).as_ptr(), ptr::null(), ptr::null_mut(), buf.as_mut_ptr(), &mut n) == ERROR_SUCCESS;
         RegCloseKey(k);
-        ok
+        ok.then(|| { buf.truncate(n as usize); buf })
+    }
+}
+
+fn exe_cmd() -> Vec<u16> {
+    let mut buf = [0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    w(&format!("\"{}\"", String::from_utf16_lossy(&buf[..n])))
+}
+
+// Галочка горит, только если Windows и правда нас запустит: путь — этот exe
+// и автозапуск не выключен в Диспетчере задач (там первый байт нечётный = выключен)
+fn autorun_get() -> bool {
+    !autorun_disabled() && reg_read(RUN_KEY, APP).is_some_and(|v| v == exe_bytes())
+}
+
+fn autorun_disabled() -> bool {
+    reg_read(STARTUP_APPROVED, APP).is_some_and(|v| v.first().is_some_and(|b| b & 1 == 1))
+}
+
+fn exe_bytes() -> Vec<u8> {
+    exe_cmd().iter().flat_map(|c| c.to_le_bytes()).collect()
+}
+
+// Exe перенесли в другую папку — автозапуск смотрел бы на старый путь; поправляем молча
+fn autorun_fix_path() {
+    // отладочная сборка из target\ не должна перехватывать автозапуск
+    if !cfg!(debug_assertions) && !autorun_disabled() && reg_read(RUN_KEY, APP).is_some_and(|v| v != exe_bytes()) {
+        autorun_set(true);
     }
 }
 
@@ -485,14 +521,17 @@ fn autorun_set(on: bool) {
             return;
         }
         if on {
-            let mut buf = [0u16; 1024];
-            let n = GetModuleFileNameW(ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) as usize;
-            let val = w(&format!("\"{}\"", String::from_utf16_lossy(&buf[..n])));
+            let val = exe_cmd();
             RegSetValueExW(k, w(APP).as_ptr(), 0, REG_SZ, val.as_ptr() as *const u8, (val.len() * 2) as u32);
         } else {
             RegDeleteValueW(k, w(APP).as_ptr());
         }
         RegCloseKey(k);
+        // сняли запрет из Диспетчера задач: без записи там автозапуск считается включённым
+        if on && RegOpenKeyExW(HKEY_CURRENT_USER, w(STARTUP_APPROVED).as_ptr(), 0, KEY_SET_VALUE, &mut k) == ERROR_SUCCESS {
+            RegDeleteValueW(k, w(APP).as_ptr());
+            RegCloseKey(k);
+        }
     }
 }
 
