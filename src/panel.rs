@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 
 // ───── размеры (логические пиксели, умножаются на масштаб экрана) ─────
 const W: f32 = 360.0;
-const H: f32 = 620.0;
+const H: f32 = 552.0;
 const PAD: f32 = 20.0;
 const S: f32 = 16.0; // поле вокруг панели под тень
 const GAP: f32 = 12.0; // отступ от панели задач
@@ -57,7 +57,8 @@ enum Act {
     Motion,
     Angle,
     Reset,
-    Profile(u8),
+    Profile(u8), // сделать профиль активным (кнопка «›»)
+    Name,        // имя профиля: двойной клик — переименовать
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -81,7 +82,8 @@ struct Panel {
     entered: bool, // курсор уже побывал на панели — только тогда уход с неё сворачивает
     reset_armed: bool,
     names: [String; 3],                  // свои имена профилей, хранятся на компе
-    editing: Option<(usize, String)>,    // переименовываем профиль: номер с нуля и набранный текст
+    editing: Option<(usize, String)>,
+    cache: [Option<Settings>; 3],        // настройки всех профилей: переключение показывается сразу, мышь догоняет в фоне    // переименовываем профиль: номер с нуля и набранный текст
     // анимация и место
     visible: bool,
     closing: bool,
@@ -122,6 +124,7 @@ struct Loaded {
     set: Option<Settings>,
     battery: Option<(u8, bool)>,
     wired: bool,
+    others: Vec<Settings>, // остальные профили — читаются при открытии панели
 }
 static RESULT: Mutex<Option<Loaded>> = Mutex::new(None);
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -136,7 +139,7 @@ fn run(hwnd: HWND, job: Option<Job>) {
     let hwnd = hwnd as isize;
     thread::spawn(move || {
         let _l = mouse::lock();
-        let mut out = Loaded { seq, set: None, battery: None, wired: false };
+        let mut out = Loaded { seq, set: None, battery: None, wired: false, others: Vec::new() };
         let mut paths = crate::hid_paths();
         if let Some(p) = DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             paths.insert(0, p);
@@ -154,10 +157,15 @@ fn run(hwnd: HWND, job: Option<Job>) {
             if d.cmd(1, 0, 0x85, &[]).is_none() {
                 continue;
             }
+            let opening = job.is_none();
             if let Some(j) = job.take() {
                 j(&d);
             }
             out.set = d.read();
+            if let (true, Some(cur)) = (opening, &out.set) {
+                // после переключения мышь ~0,35 с подгружает профиль и молчит — поэтому все профили читаем заранее
+                out.others = (1..=mouse::PROFILES).filter(|&n| n != cur.profile).filter_map(|n| d.read_profile(n)).collect();
+            }
             out.battery = d.battery();
             out.wired = String::from_utf16_lossy(&p).to_ascii_lowercase().contains("pid_0046");
             *DEV_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
@@ -202,7 +210,7 @@ pub fn init() {
 
         let p = Panel {
             hwnd, scale, set: None, battery: None, wired: false, status: Status::Loading,
-            hits: Vec::new(), hover: None, entered: false, reset_armed: false, names: load_names(), editing: None, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
+            hits: Vec::new(), hover: None, entered: false, reset_armed: false, names: load_names(), editing: None, cache: [None, None, None], visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
             genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, fg_at_open: ptr::null_mut(),
             dc: ptr::null_mut(), dib: ptr::null_mut(), old: ptr::null_mut(), bits: ptr::null_mut(), buf_w: 0, buf_h: 0,
@@ -415,14 +423,18 @@ impl Panel {
             return;
         }
         let act = self.hit(self.logical(lp));
-        if let Some((i, _)) = &self.editing {
-            if act == Some(Act::Profile(*i as u8 + 1)) {
-                return; // второй «отпуск» двойного клика по тому же профилю
-            }
+        if act == Some(Act::Name) {
+            return; // имя меняется двойным кликом, одиночный ничего не делает
+        }
+        if self.editing.is_some() {
             self.finish_edit(true);
             self.render();
         }
         let Some(act) = act else { return };
+        if let Act::Profile(n) = act {
+            self.switch_profile(n);
+            return;
+        }
         if act == Act::Reset && !self.reset_armed {
             // сброс — только со второго клика, чтобы не стереть настройки случайно
             self.reset_armed = true;
@@ -432,9 +444,7 @@ impl Panel {
         }
         let Some(s) = self.set.as_mut() else { return };
         let p = s.profile;
-        if act == Act::Profile(p) {
-            return; // уже активен
-        }
+
         // меняем на экране сразу, запись — в фоне; после записи мышь перечитывается и покажет правду
         let job: Job = match act {
             Act::Stage(i) => {
@@ -458,10 +468,7 @@ impl Panel {
                 let on = s.motion_sync;
                 Box::new(move |d| { d.set_motion_sync(p, on); })
             }
-            Act::Profile(n) => {
-                s.profile = n; // остальное перечитается с мыши уже для нового профиля
-                Box::new(move |d| { d.set_profile(n); })
-            }
+            Act::Profile(_) | Act::Name => return,
             Act::Reset => {
                 self.reset_armed = false;
                 unsafe { KillTimer(self.hwnd, T_RESET) };
@@ -491,10 +498,26 @@ impl Panel {
         self.render();
     }
 
-    // Двойной клик по профилю — ввод имени прямо в кнопке
+    // Сразу показываем настройки профиля из запаса, а мышь переключается в фоне
+    fn switch_profile(&mut self, n: u8) {
+        let Some(cur) = self.set.clone() else { return };
+        if cur.profile == n {
+            return;
+        }
+        self.flush_dpi(); // недописанные DPI — в старый профиль
+        self.cache[(cur.profile as usize).clamp(1, 3) - 1] = Some(cur.clone());
+        self.set = Some(match self.cache[n as usize - 1].clone() {
+            Some(c) => c,
+            None => Settings { profile: n, ..cur },
+        });
+        run(self.hwnd, Some(Box::new(move |d| { d.set_profile(n); })));
+        self.render();
+    }
+
+    // Двойной клик по имени профиля — ввод нового имени прямо на месте
     fn dblclick(&mut self, lp: LPARAM) {
-        if let Some(Act::Profile(n)) = self.hit(self.logical(lp)) {
-            let i = n as usize - 1;
+        if let (Some(Act::Name), Some(s)) = (self.hit(self.logical(lp)), &self.set) {
+            let i = (s.profile as usize).clamp(1, 3) - 1;
             self.editing = Some((i, self.names[i].clone()));
             force_foreground(self.hwnd); // иначе буквы уйдут в другое окно
             self.render();
@@ -546,6 +569,10 @@ impl Panel {
             return;
         }
         self.status = if r.set.is_some() { Status::Ready } else { Status::NoMouse };
+        for s in r.others.into_iter().chain(r.set.clone()) {
+            let i = (s.profile as usize).clamp(1, 3) - 1;
+            self.cache[i] = Some(s);
+        }
         if r.set.is_some() {
             self.set = r.set;
             self.wired = r.wired;
@@ -676,45 +703,52 @@ impl Panel {
             let label = if ch { format!("{pct}% · заряжается") } else { format!("{pct}%") };
             d.text(&label, 13.0, true, FG, rf(x - 190.0, 19.0, 184.0, 20.0), Align::Right);
         }
+        let hov = self.hover;
         let status = match self.status {
-            Status::Loading if self.set.is_none() => "Читаю настройки мыши…".to_string(),
-            Status::NoMouse => "Мышь спит или не подключена — пошевели её".to_string(),
-            _ => match &self.set {
-                Some(_) => (if self.wired { "Подключена по проводу" } else { "Подключена через донгл" }).to_string(),
-                None => String::new(),
-            },
+            Status::Loading if self.set.is_none() => Some("Читаю настройки мыши…"),
+            Status::NoMouse => Some("Мышь спит или не подключена — пошевели её"),
+            _ => None,
         };
-        d.text(&status, 12.0, false, MUTED, rf(PAD, 44.0, W - 2.0 * PAD, 18.0), Align::Left);
+        if let Some(t) = status {
+            d.text(t, 12.0, false, MUTED, rf(PAD, 44.0, W - 2.0 * PAD, 18.0), Align::Left);
+        }
 
         let Some(s) = self.set.clone() else {
             self.hits = hits;
             return;
         };
-        let hov = self.hover;
-
-        // профили мыши: клик — сделать активным, двойной клик — дать имя
-        d.text("Профиль", 12.0, false, MUTED, rf(PAD, 76.0, 100.0, 18.0), Align::Left);
-        d.text("двойной клик — переименовать", 11.0, false, MUTED, rf(W - PAD - 200.0, 77.0, 200.0, 16.0), Align::Right);
-        let labels: Vec<(String, Act)> = (1..=mouse::PROFILES).map(|n| {
-            let i = n as usize - 1;
-            let label = match &self.editing {
-                Some((e, buf)) if *e == i => format!("{buf}|"),
-                _ if self.names[i].is_empty() => format!("Профиль {n}"),
-                _ => self.names[i].clone(),
+        if status.is_none() {
+            // имя профиля (двойной клик — переименовать), «›» — следующий профиль, способ подключения
+            let i = (s.profile as usize).clamp(1, 3) - 1;
+            let name = match &self.editing {
+                Some((_, buf)) => format!("{buf}|"),
+                None if self.names[i].is_empty() => format!("Профиль {}", s.profile),
+                None => self.names[i].clone(),
             };
-            (label, Act::Profile(n))
-        }).collect();
-        segments(&d, 96.0, &labels, Act::Profile(s.profile), hov, &mut hits);
+            let nw = d.measure(&name, 12.0, true).max(12.0);
+            if self.editing.is_some() {
+                d.round(PAD - 5.0, 41.0, nw + 10.0, 23.0, 7.0, CARD_HOVER);
+            }
+            d.text(&name, 12.0, true, FG, rf(PAD, 44.0, nw + 4.0, 18.0), Align::Left);
+            hits.push((rf(PAD - 5.0, 40.0, nw + 10.0, 25.0), Act::Name));
+            let next = s.profile % mouse::PROFILES + 1;
+            let b = rf(PAD + nw + 6.0, 41.0, 22.0, 22.0);
+            d.round(b.X, b.Y, b.Width, b.Height, 7.0, if hov == Some(Act::Profile(next)) { CARD_HOVER } else { CARD });
+            d.text("›", 15.0, true, FG, rf(b.X, b.Y - 1.5, b.Width, b.Height), Align::Center);
+            hits.push((b, Act::Profile(next)));
+            let conn = if self.wired { "· по проводу" } else { "· через донгл" };
+            d.text(conn, 12.0, false, MUTED, rf(b.X + b.Width + 6.0, 44.0, 200.0, 18.0), Align::Left);
+        }
 
         // DPI: большая цифра активной ступени и сами ступени
-        d.text("DPI", 12.0, false, MUTED, rf(PAD, 144.0, 100.0, 18.0), Align::Left);
-        d.text(&s.stages[s.active].to_string(), 34.0, true, FG, rf(PAD - 2.0, 160.0, 200.0, 44.0), Align::Left);
+        d.text("DPI", 12.0, false, MUTED, rf(PAD, 76.0, 100.0, 18.0), Align::Left);
+        d.text(&s.stages[s.active].to_string(), 34.0, true, FG, rf(PAD - 2.0, 92.0, 200.0, 44.0), Align::Left);
         d.text("клик — выбрать
-колёсико — изменить", 11.0, false, MUTED, rf(W - PAD - 160.0, 168.0, 160.0, 34.0), Align::Right);
+колёсико — изменить", 11.0, false, MUTED, rf(W - PAD - 160.0, 100.0, 160.0, 34.0), Align::Right);
         let n = s.stages.len() as f32;
         let cw = (W - 2.0 * PAD - (n - 1.0) * 6.0) / n;
         for (i, &v) in s.stages.iter().enumerate() {
-            let r = rf(PAD + i as f32 * (cw + 6.0), 212.0, cw, 34.0);
+            let r = rf(PAD + i as f32 * (cw + 6.0), 144.0, cw, 34.0);
             let on = i == s.active;
             let bg = if on { ACCENT } else if hov == Some(Act::Stage(i)) { CARD_HOVER } else { CARD };
             d.round(r.X, r.Y, r.Width, r.Height, 10.0, bg);
@@ -726,24 +760,24 @@ impl Panel {
         let polls = if self.wired { mouse::POLL_WIRED } else { mouse::POLL_DONGLE };
         let labels: Vec<(String, Act)> = polls.iter()
             .map(|&hz| (if hz >= 1000 { format!("{}K", hz / 1000) } else { hz.to_string() }, Act::Poll(hz))).collect();
-        d.text("Частота опроса, Гц", 12.0, false, MUTED, rf(PAD, 262.0, 200.0, 18.0), Align::Left);
-        segments(&d, 282.0, &labels, Act::Poll(s.poll), hov, &mut hits);
+        d.text("Частота опроса, Гц", 12.0, false, MUTED, rf(PAD, 194.0, 200.0, 18.0), Align::Left);
+        segments(&d, 214.0, &labels, Act::Poll(s.poll), hov, &mut hits);
 
         // высота отрыва
         let labels: Vec<(String, Act)> = mouse::LODS.iter().map(|&(c, l)| (l.to_string(), Act::Lod(c))).collect();
-        d.text("Высота отрыва", 12.0, false, MUTED, rf(PAD, 330.0, 200.0, 18.0), Align::Left);
-        segments(&d, 350.0, &labels, Act::Lod(s.lod), hov, &mut hits);
+        d.text("Высота отрыва", 12.0, false, MUTED, rf(PAD, 262.0, 200.0, 18.0), Align::Left);
+        segments(&d, 282.0, &labels, Act::Lod(s.lod), hov, &mut hits);
 
         // сон
         let labels: Vec<(String, Act)> = mouse::SLEEP_S.iter().map(|&(v, l)| (l.to_string(), Act::Sleep(v))).collect();
-        d.text("Засыпать через", 12.0, false, MUTED, rf(PAD, 398.0, 200.0, 18.0), Align::Left);
-        segments(&d, 418.0, &labels, Act::Sleep(s.sleep_s), hov, &mut hits);
+        d.text("Засыпать через", 12.0, false, MUTED, rf(PAD, 330.0, 200.0, 18.0), Align::Left);
+        segments(&d, 350.0, &labels, Act::Sleep(s.sleep_s), hov, &mut hits);
 
         // переключатели
         let rows = [("Motion Sync", "плавнее движение, чуть больше задержка", s.motion_sync, Act::Motion),
             ("Angle Snap", "выпрямляет линии — для рисования", s.angle_snap, Act::Angle)];
         for (k, (name, hint, on, act)) in rows.into_iter().enumerate() {
-            let y = 470.0 + k as f32 * 46.0;
+            let y = 402.0 + k as f32 * 46.0;
             let row = rf(PAD - 8.0, y - 4.0, W - 2.0 * PAD + 16.0, 42.0);
             if hov == Some(act) {
                 d.round(row.X, row.Y, row.Width, row.Height, 10.0, CARD);
@@ -757,7 +791,7 @@ impl Panel {
         }
 
         // сброс к заводским
-        let r = rf(PAD, 568.0, W - 2.0 * PAD, 34.0);
+        let r = rf(PAD, 500.0, W - 2.0 * PAD, 34.0);
         let armed = self.reset_armed;
         let bg = if armed { RED } else if hov == Some(Act::Reset) { CARD_HOVER } else { CARD };
         d.round(r.X, r.Y, r.Width, r.Height, 10.0, bg);
@@ -850,6 +884,20 @@ impl Draw<'_> {
             GdipCreateSolidFill(c, &mut b);
             GdipFillEllipse(self.g, b as *mut GpBrush, x, y, w, h);
             GdipDeleteBrush(b as *mut GpBrush);
+        }
+    }
+
+    // Ширина строки — чтобы поставить «›» сразу за именем профиля
+    fn measure(&self, s: &str, size: f32, bold: bool) -> f32 {
+        unsafe {
+            let mut font = ptr::null_mut();
+            GdipCreateFont(if bold { self.f.semibold } else { self.f.regular }, size, 0, UnitPixel, &mut font);
+            let ws: Vec<u16> = s.encode_utf16().collect();
+            let mut out = rf(0.0, 0.0, 0.0, 0.0);
+            GdipMeasureString(self.g, ws.as_ptr(), ws.len() as i32, font, &rf(0.0, 0.0, 1000.0, 100.0), ptr::null_mut(),
+                &mut out, ptr::null_mut(), ptr::null_mut());
+            GdipDeleteFont(font);
+            out.Width
         }
     }
 
@@ -1117,3 +1165,4 @@ mod tests {
         assert!(dst.iter().all(|&p| p == 0));
     }
 }
+

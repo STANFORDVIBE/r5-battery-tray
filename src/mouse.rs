@@ -97,8 +97,12 @@ impl Dev {
     }
 
     pub fn read(&self) -> Option<Settings> {
-        let profile = self.cmd(1, 0, 0x85, &[])?[7].max(1);
-        let p = profile;
+        self.read_profile(self.cmd(1, 0, 0x85, &[])?[7].max(1))
+    }
+
+    // Настройки любого профиля без переключения на него: номер профиля идёт в каждой команде
+    pub fn read_profile(&self, p: u8) -> Option<Settings> {
+        let profile = p;
         let st = self.cmd(10, 1, 0x81, &[p, MAX_STAGES as u8])?;
         let n = (st[8] as usize).clamp(1, MAX_STAGES);
         let stages = (0..n).map(|i| u16::from_be_bytes([st[9 + i * 4], st[10 + i * 4]])).collect();
