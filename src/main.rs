@@ -94,7 +94,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER => { remove_old_exe(); update(); notify(NIM_MODIFY); }
         WM_TRAY => match lp as u32 {
             WM_LBUTTONUP => panel::toggle(),
-            WM_RBUTTONUP => menu(hwnd),
+            WM_RBUTTONUP => { panel::hide_now(); menu(hwnd) } // меню стопорит программу — анимация застыла бы на полпути
             _ => {}
         },
         m if m == tb && tb != 0 => notify(NIM_ADD),

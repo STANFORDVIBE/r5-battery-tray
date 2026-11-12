@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 
 // ───── размеры (логические пиксели, умножаются на масштаб экрана) ─────
 const W: f32 = 360.0;
-const H: f32 = 530.0;
+const H: f32 = 538.0;
 const PAD: f32 = 20.0;
 const S: f32 = 16.0; // поле вокруг панели под тень
 const GAP: f32 = 12.0; // отступ от панели задач
@@ -227,6 +227,28 @@ fn with<R>(f: impl FnOnce(&mut Panel) -> R) -> Option<R> {
 // ───── открыть / закрыть ─────
 
 // Клик по иконке: открыть или спрятать
+// Спрятать сразу, без анимации: перед меню трея (его модальный цикл остановил бы кадры)
+pub fn hide_now() {
+    with(|p| {
+        if !p.visible {
+            return;
+        }
+        p.flush_dpi();
+        p.finish_edit(true);
+        p.drop_snap();
+        p.visible = false;
+        p.closing = false;
+        p.progress = 0.0;
+        p.hidden_at = Some(Instant::now());
+        unsafe {
+            KillTimer(p.hwnd, T_WATCH);
+            KillTimer(p.hwnd, T_LEAVE);
+            ShowWindow(p.hwnd, SW_HIDE);
+        }
+        p.move_to(p.panel_rc);
+    });
+}
+
 pub fn toggle() {
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
@@ -308,6 +330,9 @@ impl Panel {
 
     // Один кадр; false — анимация закончилась
     fn animate(&mut self) -> bool {
+        if !self.visible {
+            return false; // спрятали мгновенно (hide_now) — кадры больше не нужны
+        }
         let ms = if self.genie { if self.closing { CLOSE_MS } else { OPEN_MS } } else if self.closing { 160.0 } else { 230.0 };
         let t = (self.anim_start.elapsed().as_secs_f32() * 1000.0 / ms).min(1.0);
         self.progress = if self.closing { self.anim_from * (1.0 - t) } else { self.anim_from + (1.0 - self.anim_from) * t };
@@ -790,13 +815,16 @@ impl Panel {
             hits.push((row, act));
         }
 
-        // сброс к заводским: тихая ссылка внизу, краснеет при наведении; сброс — со второго клика
+        // сброс к заводским: маленькая кнопка ↺ внизу по центру; подпись появляется при наведении, сброс — со второго клика
         let armed = self.reset_armed;
-        let label = if armed { "Нажми ещё раз — сброшу" } else { "Сбросить к заводским" };
-        let tw = d.measure(label, 12.0, armed);
-        let r = rf((W - tw) / 2.0 - 8.0, 494.0, tw + 16.0, 24.0);
-        let c = if armed || hov == Some(Act::Reset) { RED } else { MUTED };
-        d.text(label, 12.0, armed, c, rf(0.0, r.Y + 3.0, W, 18.0), Align::Center);
+        let hot = hov == Some(Act::Reset);
+        let r = rf(W / 2.0 - 14.0, 494.0, 28.0, 28.0);
+        d.round(r.X, r.Y, r.Width, r.Height, 14.0, if armed { RED } else if hot { CARD_HOVER } else { CARD });
+        d.reset_icon(W / 2.0, r.Y + 14.0, if armed { FG } else if hot { RED } else { MUTED });
+        if armed || hot {
+            let label = if armed { "Нажми ещё раз — сброшу" } else { "Заводские настройки" };
+            d.text(label, 11.0, armed, if armed { RED } else { MUTED }, rf(r.X + r.Width + 8.0, r.Y + 6.0, 150.0, 16.0), Align::Left);
+        }
         hits.push((r, Act::Reset));
         self.hits = hits;
     }
@@ -883,6 +911,33 @@ impl Draw<'_> {
             let mut b = ptr::null_mut();
             GdipCreateSolidFill(c, &mut b);
             GdipFillEllipse(self.g, b as *mut GpBrush, x, y, w, h);
+            GdipDeleteBrush(b as *mut GpBrush);
+        }
+    }
+
+    // Значок «вернуть»: дуга со стрелкой, рисуем сами — в Segoe UI такого символа может не быть
+    fn reset_icon(&self, cx: f32, cy: f32, c: u32) {
+        let rad = 6.0f32;
+        let (start, sweep) = (-60.0f32, -280.0f32); // против часовой, разрыв сверху справа
+        unsafe {
+            let mut pen = ptr::null_mut();
+            GdipCreatePen1(c, 1.7, UnitWorld, &mut pen);
+            GdipSetPenStartCap(pen, LineCapRound);
+            GdipDrawArc(self.g, pen, cx - rad, cy - rad, 2.0 * rad, 2.0 * rad, start, sweep);
+            GdipDeletePen(pen);
+            // наконечник на конце дуги, по касательной в сторону движения
+            let a = (start + sweep).to_radians();
+            let (px, py) = (cx + rad * a.cos(), cy + rad * a.sin());
+            let (dx, dy) = (a.sin(), -a.cos()); // касательная при обходе против часовой
+            let (nx, ny) = (a.cos(), a.sin());
+            let pts = [
+                PointF { X: px + dx * 3.2, Y: py + dy * 3.2 },
+                PointF { X: px - dx * 1.0 + nx * 3.0, Y: py - dy * 1.0 + ny * 3.0 },
+                PointF { X: px - dx * 1.0 - nx * 3.0, Y: py - dy * 1.0 - ny * 3.0 },
+            ];
+            let mut b = ptr::null_mut();
+            GdipCreateSolidFill(c, &mut b);
+            GdipFillPolygon(self.g, b as *mut GpBrush, pts.as_ptr(), 3, FillModeAlternate);
             GdipDeleteBrush(b as *mut GpBrush);
         }
     }
