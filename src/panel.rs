@@ -96,6 +96,7 @@ struct Panel {
     slide: (f32, f32),
     snap: Vec<u32>, // снимок панели для «джинна» (PARGB, ширина и высота — как у panel_rc); пусто — нет анимации
     snap_w: usize,
+    card: (i32, i32, Vec<u32>), // тень и фон карточки для буфера w×h: рисуются один раз, это ~80% времени кадра
     fg_at_open: HWND,
     // буфер кадра
     dc: HDC,
@@ -207,7 +208,7 @@ pub fn init() {
             hwnd, scale, set: None, battery: None, wired: false, status: Status::Loading,
             hits: Vec::new(), hover: None, entered: false, names: load_names(), editing: None, after_dbl: false, cache: [None, None, None], confirmed: None, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
-            genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, fg_at_open: ptr::null_mut(),
+            genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, card: (0, 0, Vec::new()), fg_at_open: ptr::null_mut(),
             dc: ptr::null_mut(), dib: ptr::null_mut(), old: ptr::null_mut(), bits: ptr::null_mut(), buf_w: 0, buf_h: 0,
             fonts: Fonts { regular, semibold },
         };
@@ -663,8 +664,8 @@ impl Panel {
             GdipCreateBitmapFromScan0(w, h, w * 4, PARGB, self.bits, &mut bmp);
             let mut g = ptr::null_mut();
             GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut g);
-            GdipGraphicsClear(g, 0);
             let alpha = if !self.snap.is_empty() {
+                GdipGraphicsClear(g, 0);
                 let pr = self.panel_rc;
                 let dst = std::slice::from_raw_parts_mut(self.bits as *mut u32, (w * h) as usize);
                 genie_frame(dst, w as usize, &self.snap, self.snap_w,
@@ -673,9 +674,15 @@ impl Panel {
             } else {
                 let e = 1.0 - (1.0 - self.progress).powi(3);
                 let (dx, dy) = (self.slide.0 * SLIDE * (1.0 - e), self.slide.1 * SLIDE * (1.0 - e));
+                let moving = dx != 0.0 || dy != 0.0;
+                if moving {
+                    GdipGraphicsClear(g, 0);
+                } else {
+                    self.card_into(self.bits as *mut u32, w, h);
+                }
                 GdipScaleWorldTransform(g, self.scale, self.scale, MatrixOrderPrepend);
                 GdipTranslateWorldTransform(g, S + dx, S + dy, MatrixOrderPrepend);
-                self.draw_all(g);
+                self.draw_all(g, moving);
                 (255.0 * e) as u8
             };
             GdipDeleteGraphics(g);
@@ -693,6 +700,7 @@ impl Panel {
         let r = self.panel_rc;
         let (w, h) = (r.right - r.left, r.bottom - r.top);
         let mut buf = vec![0u32; (w * h) as usize];
+        self.card_into(buf.as_mut_ptr(), w, h);
         unsafe {
             let mut bmp = ptr::null_mut();
             GdipCreateBitmapFromScan0(w, h, w * 4, PARGB, buf.as_mut_ptr() as *mut u8, &mut bmp);
@@ -700,7 +708,7 @@ impl Panel {
             GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut g);
             GdipScaleWorldTransform(g, self.scale, self.scale, MatrixOrderPrepend);
             GdipTranslateWorldTransform(g, S, S, MatrixOrderPrepend);
-            self.draw_all(g);
+            self.draw_all(g, false);
             GdipDeleteGraphics(g);
             GdipDisposeImage(bmp as *mut GpImage);
         }
@@ -712,20 +720,38 @@ impl Panel {
         self.snap = Vec::new();
     }
 
-    unsafe fn draw_all(&mut self, g: *mut GpGraphics) {
+    // Положить в dst (w×h) готовые тень и фон карточки; нарисовать их, если размер поменялся
+    fn card_into(&mut self, dst: *mut u32, w: i32, h: i32) {
+        if (self.card.0, self.card.1) != (w, h) {
+            let mut buf = vec![0u32; (w * h) as usize];
+            unsafe {
+                let mut bmp = ptr::null_mut();
+                GdipCreateBitmapFromScan0(w, h, w * 4, PARGB, buf.as_mut_ptr() as *mut u8, &mut bmp);
+                let mut g = ptr::null_mut();
+                GdipGetImageGraphicsContext(bmp as *mut GpImage, &mut g);
+                GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+                GdipScaleWorldTransform(g, self.scale, self.scale, MatrixOrderPrepend);
+                GdipTranslateWorldTransform(g, S, S, MatrixOrderPrepend);
+                draw_card(&Draw { g, f: &self.fonts });
+                GdipDeleteGraphics(g);
+                GdipDisposeImage(bmp as *mut GpImage);
+            }
+            self.card = (w, h, buf);
+        }
+        unsafe { ptr::copy_nonoverlapping(self.card.2.as_ptr(), dst, (w * h) as usize) };
+    }
+
+    // card: false — тень и фон уже лежат в буфере (card_into)
+    unsafe fn draw_all(&mut self, g: *mut GpGraphics, card: bool) {
         GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
         // ClearType на прозрачном окне даёт цветную бахрому — только сглаживание в оттенках серого
         GdipSetTextRenderingHint(g, TextRenderingHintAntiAliasGridFit);
         let d = Draw { g, f: &self.fonts };
         let mut hits = Vec::new();
 
-        // карточка с тенью
-        for i in (1..=S as i32).rev().step_by(2) {
-            let i = i as f32;
-            d.round(-i + 2.0, -i + 5.0, W + 2.0 * i - 4.0, H + 2.0 * i - 4.0, 14.0 + i, 0x0900_0000);
+        if card {
+            draw_card(&d);
         }
-        d.round(0.0, 0.0, W, H, 14.0, BG);
-        d.round_outline(0.0, 0.0, W, H, 14.0, 0x1CFF_FFFF);
 
         // шапка: название и заряд
         d.text("R5 Ultra", 18.0, true, FG, rf(PAD, 16.0, 200.0, 26.0), Align::Left);
@@ -833,6 +859,16 @@ impl Panel {
 }
 
 // Ряд кнопок-сегментов во всю ширину; выбранная — бирюзовая
+// Карточка с тенью — фон под всем содержимым панели
+fn draw_card(d: &Draw) {
+    for i in (1..=S as i32).rev().step_by(2) {
+        let i = i as f32;
+        d.round(-i + 2.0, -i + 5.0, W + 2.0 * i - 4.0, H + 2.0 * i - 4.0, 14.0 + i, 0x0900_0000);
+    }
+    d.round(0.0, 0.0, W, H, 14.0, BG);
+    d.round_outline(0.0, 0.0, W, H, 14.0, 0x1CFF_FFFF);
+}
+
 fn segments(d: &Draw, y: f32, items: &[(String, Act)], selected: Act, hover: Option<Act>, hits: &mut Vec<(RectF, Act)>) {
     let n = items.len() as f32;
     d.round(PAD, y, W - 2.0 * PAD, 34.0, 11.0, CARD);
