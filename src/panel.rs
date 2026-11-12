@@ -80,6 +80,7 @@ struct Panel {
     entered: bool, // курсор уже побывал на панели — только тогда уход с неё сворачивает
     names: [String; 3],                  // свои имена профилей, хранятся на компе
     editing: Option<(usize, String)>,    // переименовываем профиль: номер с нуля и набранный текст
+    after_dbl: bool,                     // отпускание кнопки после двойного клика — не клик
     cache: [Option<Settings>; 3],        // настройки всех профилей: переключение показывается сразу, мышь догоняет в фоне
     confirmed: Option<Settings>,         // что мышь сказала в последний раз — к этому откатываемся, если запись не дошла
     // анимация и место
@@ -204,7 +205,7 @@ pub fn init() {
 
         let p = Panel {
             hwnd, scale, set: None, battery: None, wired: false, status: Status::Loading,
-            hits: Vec::new(), hover: None, entered: false, names: load_names(), editing: None, cache: [None, None, None], confirmed: None, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
+            hits: Vec::new(), hover: None, entered: false, names: load_names(), editing: None, after_dbl: false, cache: [None, None, None], confirmed: None, visible: false, closing: false, progress: 0.0, anim_from: 0.0,
             anim_start: Instant::now(), hidden_at: None, anchor: POINT { x: 0, y: 0 }, panel_rc: mem::zeroed(),
             genie: true, slide: (0.0, 1.0), snap: Vec::new(), snap_w: 0, fg_at_open: ptr::null_mut(),
             dc: ptr::null_mut(), dib: ptr::null_mut(), old: ptr::null_mut(), bits: ptr::null_mut(), buf_w: 0, buf_h: 0,
@@ -449,7 +450,7 @@ impl Panel {
     }
 
     fn click(&mut self, lp: LPARAM) {
-        if self.animating() {
+        if mem::take(&mut self.after_dbl) || self.animating() {
             return;
         }
         let act = self.hit(self.logical(lp));
@@ -536,6 +537,7 @@ impl Panel {
         if let (Some(Act::Name), Some(s)) = (self.hit(self.logical(lp)), &self.set) {
             let i = (s.profile as usize).clamp(1, 3) - 1;
             self.editing = Some((i, self.names[i].clone()));
+            self.after_dbl = true;
             force_foreground(self.hwnd); // иначе буквы уйдут в другое окно
             self.render();
         }
@@ -753,12 +755,15 @@ impl Panel {
         if status.is_none() {
             // имя профиля (двойной клик — переименовать), «›» — следующий профиль, способ подключения
             let i = (s.profile as usize).clamp(1, 3) - 1;
+            let label = if self.names[i].is_empty() { format!("Профиль {}", s.profile) } else { self.names[i].clone() };
             let name = match &self.editing {
                 Some((_, buf)) => format!("{buf}|"),
-                None if self.names[i].is_empty() => format!("Профиль {}", s.profile),
-                None => self.names[i].clone(),
+                None => label.clone(),
             };
-            let nw = d.measure(&name, 12.0, true).max(12.0);
+            let mut nw = d.measure(&name, 12.0, true).max(12.0);
+            if self.editing.is_some() {
+                nw = nw.max(d.measure(&label, 12.0, true)); // поле ввода не уже имени — «›» не уезжает под курсор
+            }
             if self.editing.is_some() {
                 d.round(PAD - 5.0, 41.0, nw + 10.0, 23.0, 7.0, CARD_HOVER);
             }
