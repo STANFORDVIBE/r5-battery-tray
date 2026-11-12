@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 
 // ───── размеры (логические пиксели, умножаются на масштаб экрана) ─────
 const W: f32 = 360.0;
-const H: f32 = 498.0;
+const H: f32 = 518.0;
 const PAD: f32 = 20.0;
 const S: f32 = 16.0; // поле вокруг панели под тень
 const GAP: f32 = 12.0; // отступ от панели задач
@@ -815,16 +815,19 @@ impl Panel {
             hits.push((row, act));
         }
 
-        // сброс к заводским: маленькая кнопка ↺ справа под зарядом; подпись под ней при наведении, сброс — со второго клика
+        // сброс к заводским: крошечная ↺ в правом нижнем углу; клик — на её месте красный вопрос, клик по нему — сброс
         let armed = self.reset_armed;
         let hot = hov == Some(Act::Reset);
-        let r = rf(W - PAD - 24.0, 40.0, 24.0, 24.0);
-        d.round(r.X, r.Y, r.Width, r.Height, 12.0, if armed { RED } else if hot { CARD_HOVER } else { CARD });
-        d.reset_icon(r.X + 12.0, r.Y + 12.0, if armed { FG } else if hot { RED } else { MUTED });
-        if armed || hot {
-            let label = if armed { "Нажми ещё раз — сброшу" } else { "Заводские настройки" };
-            d.text(label, 11.0, armed, if armed { RED } else { MUTED }, rf(W - PAD - 200.0, 67.0, 200.0, 16.0), Align::Right);
-        }
+        let y = 494.0;
+        let r = if armed {
+            let q = "Вернуть к заводским настройкам?";
+            let tw = d.measure(q, 11.0, true);
+            d.text(q, 11.0, true, RED, rf(W - PAD - 250.0, y, 250.0, 16.0), Align::Right);
+            rf(W - PAD - tw - 4.0, y - 2.0, tw + 8.0, 20.0)
+        } else {
+            d.reset_icon(W - PAD - 6.0, y + 8.0, 3.5, if hot { RED } else { MUTED });
+            rf(W - PAD - 14.0, y - 2.0, 18.0, 20.0)
+        };
         hits.push((r, Act::Reset));
         self.hits = hits;
     }
@@ -916,12 +919,12 @@ impl Draw<'_> {
     }
 
     // Значок «вернуть»: дуга со стрелкой, рисуем сами — в Segoe UI такого символа может не быть
-    fn reset_icon(&self, cx: f32, cy: f32, c: u32) {
-        let rad = 6.0f32;
+    fn reset_icon(&self, cx: f32, cy: f32, rad: f32, c: u32) {
+        let k = rad / 6.0; // наконечник и толщина — в масштабе значка
         let (start, sweep) = (-60.0f32, -280.0f32); // против часовой, разрыв сверху справа
         unsafe {
             let mut pen = ptr::null_mut();
-            GdipCreatePen1(c, 1.7, UnitWorld, &mut pen);
+            GdipCreatePen1(c, (1.7 * k).max(1.2), UnitWorld, &mut pen);
             GdipSetPenStartCap(pen, LineCapRound);
             GdipDrawArc(self.g, pen, cx - rad, cy - rad, 2.0 * rad, 2.0 * rad, start, sweep);
             GdipDeletePen(pen);
@@ -931,9 +934,9 @@ impl Draw<'_> {
             let (dx, dy) = (a.sin(), -a.cos()); // касательная при обходе против часовой
             let (nx, ny) = (a.cos(), a.sin());
             let pts = [
-                PointF { X: px + dx * 3.2, Y: py + dy * 3.2 },
-                PointF { X: px - dx * 1.0 + nx * 3.0, Y: py - dy * 1.0 + ny * 3.0 },
-                PointF { X: px - dx * 1.0 - nx * 3.0, Y: py - dy * 1.0 - ny * 3.0 },
+                PointF { X: px + dx * 3.2 * k, Y: py + dy * 3.2 * k },
+                PointF { X: px - dx * k + nx * 3.0 * k, Y: py - dy * k + ny * 3.0 * k },
+                PointF { X: px - dx * k - nx * 3.0 * k, Y: py - dy * k - ny * 3.0 * k },
             ];
             let mut b = ptr::null_mut();
             GdipCreateSolidFill(c, &mut b);
